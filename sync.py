@@ -2,21 +2,23 @@
 import argparse
 import sys
 import time
-from mcap.reader import make_reader
-from mcap.writer import Writer
 from multiprocessing import Pool
-from pymavlink import mavutil
-from scipy.interpolate import interp1d
-from astropy.time import Time, TimeDelta
+
 import numpy
 import numpy.typing as npt
+from astropy.time import Time, TimeDelta
+from colorama import Fore, Style, init
+from mcap.reader import make_reader
+from mcap.writer import Writer
+from pymavlink import mavutil
+from scipy.interpolate import interp1d
 
-from colorama import init, Fore, Style
 
 class MissingDataError(Exception):
     pass
 
-def gps_time_to_unix_time(gms:int, gwk:int) -> float:
+
+def gps_time_to_unix_time(gms: int, gwk: int) -> float:
     seconds_per_week = 7 * 24 * 60 * 60
     gps_seconds_base = gwk * seconds_per_week
 
@@ -24,17 +26,17 @@ def gps_time_to_unix_time(gms:int, gwk:int) -> float:
     dt = TimeDelta(gms / 1000.0, format='sec')
     t_final = t_base + dt
 
-    gps_synced_unixtime = t_final.unix
-    return gps_synced_unixtime
+    return float(t_final.unix)
 
-def read_bin_log_timesync_rtt(bin_log_file:str) -> npt.NDArray[numpy.float64]:
-    print(f"{Fore.CYAN}Started reading {bin_log_file} log TIMESYNC messages")
-    ret:list[tuple[float, float]] = []
+
+def read_bin_log_timesync_rtt(bin_log_file: str) -> npt.NDArray[numpy.float64]:
+    print(f'{Fore.CYAN}Started reading {bin_log_file} log TIMESYNC messages')
+    ret: list[tuple[float, float]] = []
 
     log = mavutil.mavlink_connection(bin_log_file)
     while True:
         msg = log.recv_match()
-        
+
         if msg is None:
             break
 
@@ -42,22 +44,23 @@ def read_bin_log_timesync_rtt(bin_log_file:str) -> npt.NDArray[numpy.float64]:
             time_us = msg.TimeUS / 1e6
             rtt = msg.RTT / 1e6
             ret.append((time_us, rtt))
-    
+
     if len(ret) < 2:
         print(f"{Fore.RED}Didn't find any TSYN in bin log - exiting", flush=True)
-        raise MissingDataError("Missing TSYN in BIN log")
+        raise MissingDataError('Missing TSYN in BIN log')
 
-    print(f"{Fore.GREEN}Finished reading {bin_log_file} log TIMESYNC messages")
+    print(f'{Fore.GREEN}Finished reading {bin_log_file} log TIMESYNC messages')
     return numpy.array(ret)
 
-def read_bin_log_gps(bin_log_file:str) -> npt.NDArray[numpy.float64]:
-    print(f"{Fore.CYAN}Started reading {bin_log_file} log GPS messages")
-    ret:list[tuple[float, float]] = []
+
+def read_bin_log_gps(bin_log_file: str) -> npt.NDArray[numpy.float64]:
+    print(f'{Fore.CYAN}Started reading {bin_log_file} log GPS messages')
+    ret: list[tuple[float, float]] = []
 
     log = mavutil.mavlink_connection(bin_log_file)
     while True:
         msg = log.recv_match()
-        
+
         if msg is None:
             break
 
@@ -76,54 +79,66 @@ def read_bin_log_gps(bin_log_file:str) -> npt.NDArray[numpy.float64]:
 
     if len(ret) < 2:
         print(f"{Fore.RED}Didn't find any GPS time in bin log - exiting", flush=True)
-        raise MissingDataError("Missing GPS in BIN log")
+        raise MissingDataError('Missing GPS in BIN log')
 
-    print(f"{Fore.GREEN}Finished reading {bin_log_file} log GPS messages")
+    print(f'{Fore.GREEN}Finished reading {bin_log_file} log GPS messages')
     return numpy.array(ret)
 
-def read_tlog(tlog_file:str) -> npt.NDArray[numpy.float64]:
-    print(f"{Fore.CYAN}Started reading {tlog_file} TIMESYNC messages")
+
+def read_tlog(tlog_file: str) -> npt.NDArray[numpy.float64]:
+    print(f'{Fore.CYAN}Started reading {tlog_file} TIMESYNC messages')
     log = mavutil.mavlink_connection(tlog_file)
-    ret:list[tuple[float, float]] = []
+    ret: list[tuple[float, float]] = []
 
     last_time_us = 0
     while True:
         msg = log.recv_match()
-        
+
         if msg is None:
             break
-        
+
         if msg.get_type() == 'TIMESYNC':
             if msg.tc1 == 0:
                 continue
-            elif msg.tc1 != 0 and msg.ts1 != 0:
+
+            if msg.tc1 != 0 and msg.ts1 != 0:
                 unix_time = msg.tc1 / 1e9
                 time_us = msg.ts1 / 1e9
-                
+
                 # removing pixhawk restarts if there are
                 if last_time_us > time_us:
-                    print(f"{Fore.YELLOW}Pixhawk restart at(removing) TimeUS: {time_us} - UnixTime: {unix_time}")
+                    print(f'{Fore.YELLOW}Pixhawk restart at(removing) TimeUS: {time_us} - UnixTime: {unix_time}')
                     ret = []
 
                 ret.append((time_us, unix_time))
                 last_time_us = time_us
-    
+
     if len(ret) < 2:
         print(f"{Fore.RED}Didn't find any TIMESYNC in tlog - exiting", flush=True)
-        raise MissingDataError("Missing TIMESYNC in tlog")
+        raise MissingDataError('Missing TIMESYNC in tlog')
 
-    print(f"{Fore.GREEN}Finished reading {tlog_file} TIMESYNC messages")
+    print(f'{Fore.GREEN}Finished reading {tlog_file} TIMESYNC messages')
     return numpy.array(ret)
 
-def find_closes_index(value:float|int, start_index:int, sync_array:npt.NDArray[numpy.float64], compare_index:int = 0) -> int:
+
+def find_closes_index(
+    value: float | int,
+    start_index: int,
+    sync_array: npt.NDArray[numpy.float64],
+    compare_index: int = 0,
+) -> int:
     max_idx = len(sync_array) - 2
 
-    while start_index < max_idx and value > sync_array[start_index+1][compare_index]:
+    while start_index < max_idx and value > sync_array[start_index + 1][compare_index]:
         start_index += 1
-    
+
     return start_index
 
-def map_rtt_timeus_to_unixtime(rtt_times:npt.NDArray[numpy.float64], time_sync_times:npt.NDArray[numpy.float64]) -> npt.NDArray[numpy.float64]:
+
+def map_rtt_timeus_to_unixtime(
+    rtt_times: npt.NDArray[numpy.float64],
+    time_sync_times: npt.NDArray[numpy.float64],
+) -> npt.NDArray[numpy.float64]:
     idx = 0
 
     for i, entry in enumerate(rtt_times):
@@ -133,11 +148,11 @@ def map_rtt_timeus_to_unixtime(rtt_times:npt.NDArray[numpy.float64], time_sync_t
         idx = find_closes_index(time_us, idx, time_sync_times)
 
         interp_func = interp1d(
-            (time_sync_times[idx][0], time_sync_times[idx+1][0]), 
-            (time_sync_times[idx][1], time_sync_times[idx+1][1]), 
-            kind="linear", 
-            bounds_error=False, 
-            fill_value="extrapolate"
+            (time_sync_times[idx][0], time_sync_times[idx + 1][0]),
+            (time_sync_times[idx][1], time_sync_times[idx + 1][1]),
+            kind='linear',
+            bounds_error=False,
+            fill_value='extrapolate',
         )
 
         interpolated_unix = float(interp_func(time_us))
@@ -146,80 +161,107 @@ def map_rtt_timeus_to_unixtime(rtt_times:npt.NDArray[numpy.float64], time_sync_t
 
     return rtt_times
 
-def map_unix_time_to_autopilot_timeus_s(unix_time_point:float, gcs_time_sync_times:npt.NDArray[numpy.float64]) -> float:
+
+def map_unix_time_to_autopilot_timeus_s(
+    unix_time_point: float,
+    gcs_time_sync_times: npt.NDArray[numpy.float64],
+) -> float:
     time_sync_index = find_closes_index(unix_time_point, 0, gcs_time_sync_times, compare_index=1)
 
     unix_to_autopilot = interp1d(
-        (gcs_time_sync_times[time_sync_index][1], gcs_time_sync_times[time_sync_index+1][1]), 
-        (gcs_time_sync_times[time_sync_index][0], gcs_time_sync_times[time_sync_index+1][0]),
-        kind="linear", bounds_error=False, fill_value="extrapolate"
+        (gcs_time_sync_times[time_sync_index][1], gcs_time_sync_times[time_sync_index + 1][1]),
+        (gcs_time_sync_times[time_sync_index][0], gcs_time_sync_times[time_sync_index + 1][0]),
+        kind='linear',
+        bounds_error=False,
+        fill_value='extrapolate',
     )
 
     autopilot_time_s = float(unix_to_autopilot(unix_time_point))
     return autopilot_time_s
 
-def map_autopilot_timeus_to_gps_unixtime_s(autopilot_timeus_s:float,gcs_time_sync_times:npt.NDArray[numpy.float64],  gps_sync_times:npt.NDArray[numpy.float64]) -> float:
+
+def map_autopilot_timeus_to_gps_unixtime_s(
+    autopilot_timeus_s: float,
+    gcs_time_sync_times: npt.NDArray[numpy.float64],
+    gps_sync_times: npt.NDArray[numpy.float64],
+) -> float:
     gps_sync_index = find_closes_index(autopilot_timeus_s, 0, gps_sync_times)
     unix_to_autopilot = interp1d(
-        (gps_sync_times[gps_sync_index][0], gcs_time_sync_times[gps_sync_index+1][0]), 
-        (gcs_time_sync_times[gps_sync_index][1], gcs_time_sync_times[gps_sync_index+1][1]),
-        kind="linear", bounds_error=False, fill_value="extrapolate"
+        (gps_sync_times[gps_sync_index][0], gcs_time_sync_times[gps_sync_index + 1][0]),
+        (gcs_time_sync_times[gps_sync_index][1], gcs_time_sync_times[gps_sync_index + 1][1]),
+        kind='linear',
+        bounds_error=False,
+        fill_value='extrapolate',
     )
 
     gps_unix_time_s = float(unix_to_autopilot(autopilot_timeus_s))
     return gps_unix_time_s
 
-def sync_mcap_timestamp(unixtime_pt_ns:int, rtt_times:npt.NDArray[numpy.float64], gcs_time_sync_times:npt.NDArray[numpy.float64],
-                        gps_sync_times:npt.NDArray[numpy.float64]) -> int:
+
+def sync_mcap_timestamp(
+    unixtime_pt_ns: int,
+    rtt_times: npt.NDArray[numpy.float64],
+    gcs_time_sync_times: npt.NDArray[numpy.float64],
+    gps_sync_times: npt.NDArray[numpy.float64],
+) -> int:
     unixtime_pt_s = float(unixtime_pt_ns) / 1e9
 
     rtt_index = find_closes_index(unixtime_pt_s, 0, rtt_times)
     rtt_s = rtt_times[rtt_index][1]
-    
+
     autopilot_time_s = map_unix_time_to_autopilot_timeus_s(unixtime_pt_s, gcs_time_sync_times)
     corrected_autopilot_time_s = autopilot_time_s - (rtt_s / 2.0)
 
-    gps_unix_time_s = map_autopilot_timeus_to_gps_unixtime_s(corrected_autopilot_time_s, gcs_time_sync_times, gps_sync_times)
+    gps_unix_time_s = map_autopilot_timeus_to_gps_unixtime_s(
+        corrected_autopilot_time_s,
+        gcs_time_sync_times,
+        gps_sync_times,
+    )
 
     return int(gps_unix_time_s * 1e9)
 
-def sync_mcap(mcap_log_file:str, rtt_times:npt.NDArray[numpy.float64], time_sync_times:npt.NDArray[numpy.float64], gps_sync_times:npt.NDArray[numpy.float64]) -> None:
+
+def sync_mcap(
+    mcap_log_file: str,
+    rtt_times: npt.NDArray[numpy.float64],
+    time_sync_times: npt.NDArray[numpy.float64],
+    gps_sync_times: npt.NDArray[numpy.float64],
+) -> None:
     output_file = mcap_log_file.removesuffix('.mcap') + '_synced.mcap'
-    with open(mcap_log_file, "rb") as input_f, open(output_file, "wb") as output_f:
+    with open(mcap_log_file, 'rb') as input_f, open(output_file, 'wb') as output_f:
         reader = make_reader(input_f)
         writer = Writer(output_f)
-        
+
         header = reader.get_header()
-        source_profile = header.profile if header else ""
-        source_library = header.library if header else ""
+        source_profile = header.profile if header else ''
+        source_library = header.library if header else ''
         print(f"\n{Fore.MAGENTA}Detected Source Profile: '{source_profile}' | Library: '{source_library}'")
         writer.start(profile=source_profile, library=source_library)
-        
+
         schema_id_map = {}
         channel_id_map = {}
-        
-        print(f"{Fore.BLUE}Pass 1: Cloning file metadata structures...")
+
+        print(f'{Fore.BLUE}Pass 1: Cloning file metadata structures...')
         for schema_id, schema_record in reader.get_summary().schemas.items():
             new_schema_id = writer.register_schema(
                 name=schema_record.name,
                 encoding=schema_record.encoding,
-                data=schema_record.data
+                data=schema_record.data,
             )
             schema_id_map[schema_id] = new_schema_id
-            
+
         for channel_id, channel_record in reader.get_summary().channels.items():
             new_schema_id = schema_id_map.get(channel_record.schema_id, 0)
-            
+
             new_channel_id = writer.register_channel(
                 topic=channel_record.topic,
                 message_encoding=channel_record.message_encoding,
                 schema_id=new_schema_id,
-                metadata=channel_record.metadata
+                metadata=channel_record.metadata,
             )
             channel_id_map[channel_id] = new_channel_id
 
-
-        print(f"{Fore.BLUE}Pass 2: Rewriting messages with updated timestamps...")
+        print(f'{Fore.BLUE}Pass 2: Rewriting messages with updated timestamps...')
         for _, channel, message in reader.iter_messages():
             new_publish_time = sync_mcap_timestamp(message.publish_time, rtt_times, time_sync_times, gps_sync_times)
 
@@ -230,15 +272,16 @@ def sync_mcap(mcap_log_file:str, rtt_times:npt.NDArray[numpy.float64], time_sync
                 log_time=message.log_time,
                 publish_time=new_publish_time,
                 data=message.data,
-                sequence=message.sequence
+                sequence=message.sequence,
             )
-            
+
         writer.finish()
-        print(f"{Fore.GREEN}{Style.BRIGHT}File writing finished successfully: {output_file}")
+        print(f'{Fore.GREEN}{Style.BRIGHT}File writing finished successfully: {output_file}')
+
 
 def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str) -> None:
-    rtt_times:npt.NDArray[numpy.float64]
-    timesync_times:npt.NDArray[numpy.float64]
+    rtt_times: npt.NDArray[numpy.float64]
+    timesync_times: npt.NDArray[numpy.float64]
 
     pool = Pool(processes=3)
     try:
@@ -252,7 +295,11 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str) -> None:
             for h in handles:
                 if h.ready():
                     if h.get() is None:
-                        print(f"\n{Fore.RED}{Style.BRIGHT}[CRITICAL] Fast-failing due to missing tracking packets. Terminating remaining workers...", flush=True)
+                        print(
+                            f'\n{Fore.RED}{Style.BRIGHT}[CRITICAL] Fast-failing due to missing '
+                            + 'tracking packets. Terminating remaining workers...',
+                            flush=True,
+                        )
                         pool.terminate()
                         pool.join()
                         sys.exit(-1)
@@ -263,7 +310,11 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str) -> None:
         gps_timesync_times = gps_handle.get()
 
     except (MissingDataError, Exception) as e:
-        print(f"\n{Fore.RED}{Style.BRIGHT}[CRITICAL] Error or missing packets detected. Terminating remaining background tasks...", flush=True)
+        print(
+            f'\n{Fore.RED}{Style.BRIGHT}[CRITICAL] Error or missing '
+            + 'packets detected. Terminating remaining background tasks...',
+            flush=True,
+        )
         pool.terminate()
         pool.join()
         sys.exit(1)
@@ -277,14 +328,19 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str) -> None:
     rtt_times = map_rtt_timeus_to_unixtime(rtt_times, timesync_times)
     sync_mcap(mcap_path, rtt_times, timesync_times, gps_timesync_times)
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Multiprocess log file synchronizer.")
 
-    parser.add_argument("bin_path", type=str, help="Path to the input .BIN file")
-    parser.add_argument("tlog_path", type=str, help="Path to the input .tlog file")
-    
-    parser.add_argument("mcap", type=str, default="logs/log.mcap", 
-                        help="Path to the .mcap file (default: logs/log.mcap)")
+def main() -> None:
+    parser = argparse.ArgumentParser(description='Multiprocess log file synchronizer.')
+
+    parser.add_argument('bin_path', type=str, help='Path to the input .BIN file')
+    parser.add_argument('tlog_path', type=str, help='Path to the input .tlog file')
+
+    parser.add_argument(
+        'mcap',
+        type=str,
+        default='logs/log.mcap',
+        help='Path to the .mcap file (default: logs/log.mcap)',
+    )
 
     args = parser.parse_args()
     sync_parallel(
@@ -293,7 +349,8 @@ def main() -> None:
         mcap_path=args.mcap,
     )
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     init(autoreset=True)
 
     start = time.time()
@@ -301,4 +358,4 @@ if __name__ == "__main__":
     end = time.time()
 
     runtime_s = end - start
-    print(f"\n{Fore.GREEN}{Style.BRIGHT}Finished syncing logs. Took {runtime_s:.2f}s.")
+    print(f'\n{Fore.GREEN}{Style.BRIGHT}Finished syncing logs. Took {runtime_s:.2f}s.')

@@ -23,6 +23,7 @@ dev = [
     "mypy",
     "types-setuptools",
     "nuitka",
+    "pylint-pydantic"
 ]
 
 # Automated pytest parallel execution configuration
