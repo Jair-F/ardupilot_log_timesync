@@ -13,6 +13,7 @@ dependencies = [
     "mcap",
     "numpy",
     "scipy",
+    "astropy",
 ]
 
 [project.optional-dependencies]
