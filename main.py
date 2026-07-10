@@ -53,6 +53,14 @@ def read_tlog(tlog_file:str) -> npt.NDArray[numpy.float64]:
     
     return numpy.array(ret)
 
+def find_closes_index(value:float|int, start_index:int, sync_array:npt.NDArray[numpy.float64]) -> int:
+    max_idx = len(sync_array) - 2
+
+    while start_index < max_idx and value < sync_array[start_index][0]:
+        start_index += 1
+    
+    return start_index
+
 def map_rtt_timeus_to_unixtime(rtt_times:npt.NDArray[numpy.float64], time_sync_times:npt.NDArray[numpy.float64]) -> npt.NDArray[numpy.float64]:
     idx = 0
     max_idx = len(time_sync_times) - 2
@@ -61,8 +69,7 @@ def map_rtt_timeus_to_unixtime(rtt_times:npt.NDArray[numpy.float64], time_sync_t
         time_us = entry[0]
         # rtt = entry[1]
 
-        while idx < max_idx and time_us < time_sync_times[idx][0]:
-            idx += 1
+        idx = find_closes_index(time_us, idx, time_sync_times)
 
         interp_func = interp1d(
             (time_sync_times[idx][0], time_sync_times[idx+1][0]), 
@@ -77,6 +84,13 @@ def map_rtt_timeus_to_unixtime(rtt_times:npt.NDArray[numpy.float64], time_sync_t
         rtt_times[i, 0] = interpolated_unix
 
     return rtt_times
+
+def sync_mcap_timestamp(unixtime_pt_ns:int, rtt_times:npt.NDArray[numpy.float64], time_sync_times:npt.NDArray[numpy.float64]) -> int:
+    unixtime_pt_s = float(unixtime_pt_ns) / 1e9
+
+
+
+    return int(unixtime_pt_s * 1e9)
 
 def sync_mcap(mcap_log_file:str, rtt_times:npt.NDArray[numpy.float64], time_sync_times:npt.NDArray[numpy.float64]) -> None:
     # Open files for streaming
@@ -116,10 +130,10 @@ def sync_mcap(mcap_log_file:str, rtt_times:npt.NDArray[numpy.float64], time_sync
             channel_id_map[channel_id] = new_channel_id
 
 
-        time_offset_ns = 60 * 60 * 1_000_000_000 
+        # time_offset_ns = 60 * 60 * 1_000_000_000 
         print("Pass 2: Rewriting messages with updated timestamps...")
         for _, channel, message in reader.iter_messages():
-            new_publish_time = message.publish_time + time_offset_ns
+            new_publish_time = sync_mcap_timestamp(message.publish_time, rtt_times, time_sync_times)
             
             target_channel_id = channel_id_map[channel.id]
 
