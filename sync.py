@@ -13,8 +13,6 @@ import numpy.typing as npt
 
 from colorama import init, Fore, Style
 
-init(autoreset=True)
-
 class MissingDataError(Exception):
     pass
 
@@ -296,8 +294,11 @@ def main() -> None:
     )
 
 if __name__ == "__main__":
+    init(autoreset=True)
+
     start = time.time()
     main()
     end = time.time()
+
     runtime_s = end - start
     print(f"\n{Fore.GREEN}{Style.BRIGHT}Finished syncing logs. Took {runtime_s:.2f}s.")

@@ -22,6 +22,7 @@ dev = [
     "pre-commit",
     "mypy",
     "types-setuptools",
+    "nuitka",
 ]
 
 # Automated pytest parallel execution configuration
