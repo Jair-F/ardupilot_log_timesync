@@ -1,0 +1,76 @@
+exclude: ^tmp/
+
+repos:
+    - repo: https://github.com/pre-commit/pre-commit-hooks
+      rev: v6.0.0
+      hooks:
+          - id: trailing-whitespace
+          - id: end-of-file-fixer
+          - id: mixed-line-ending
+            args: [--fix=lf]
+          - id: check-yaml
+            args: [--unsafe]
+          - id: debug-statements
+          - id: double-quote-string-fixer
+          - id: requirements-txt-fixer
+          - id: check-added-large-files
+            args: ["--maxkb=512"]
+    - repo: https://github.com/asottile/add-trailing-comma
+      rev: v4.0.0
+      hooks:
+          - id: add-trailing-comma
+    - repo: https://github.com/asottile/pyupgrade # upgrades old style python code to newver version
+      rev: v3.21.2
+      hooks:
+          - id: pyupgrade
+            args: [--py312-plus]
+    - repo: https://github.com/PyCQA/autoflake
+      rev: v2.3.3
+      hooks:
+          - id: autoflake
+            args: [--in-place, --remove-all-unused-imports]
+    - repo: https://github.com/astral-sh/ruff-pre-commit
+      rev: v0.15.17
+      hooks:
+        - id: ruff
+          args: [ --fix ]
+        - id: ruff-format
+    - repo: https://github.com/pre-commit/mirrors-mypy
+      rev: v2.1.0
+      hooks:
+          - id: mypy
+            additional_dependencies: [
+                "pydantic>=2.0.0",
+                "types-PyYAML",
+                "types-setuptools"
+            ]
+            args: [
+                    "--allow-untyped-decorators", # remove if not needed
+                    "--strict",
+                    "--ignore-missing-imports",
+                    "--install-types",
+                    "--non-interactive",
+                ]
+    - repo: https://github.com/PyCQA/pylint
+      rev: v4.0.5
+      hooks:
+          - id: pylint
+            additional_dependencies: [
+                "astropy",
+                "pydronecan",
+                "pygnssutils",
+                "pymavlink",
+                "pynmeagps",
+                "pytest",
+                "fastapi",
+                "uvicorn",
+                "pylint-pydantic",
+                "pydantic",
+                "scipy",
+            ]
+            args: [
+                  "--init-hook=import pathlib, sys; sys.path.append(str(pathlib.Path(__file__).resolve().parents[3]))",
+                  "--disable=C0114", # missing-module-docstring
+                  "--disable=C0116", # missing-function-docstring
+                  "--disable=C0115", # missing-class-docstring
+                ]

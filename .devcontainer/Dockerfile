@@ -6,4 +6,4 @@ RUN sudo apt install -y python3 python3-pip git gpg tmux
 
 
 COPY pyproject.toml .
-RUN sudo uv pip install --system --break-system-packages -r pyproject.toml
+RUN uv pip install --system --break-system-packages -r pyproject.toml

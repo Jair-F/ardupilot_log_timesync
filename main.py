@@ -1,5 +1,6 @@
-import threading
-from multiprocessing import Pool, Process
+from mcap.reader import make_reader
+from mcap.writer import Writer
+from multiprocessing import Pool
 from pymavlink import mavutil
 
 def read_bin_log(bin_log_file:str) -> None:
@@ -49,6 +50,61 @@ def read_tlog(tlog_file:str) -> None:
     
     return ret
 
+def sync_mcap(mcap_log_file:str, rtt_times:list[tuple[float, float]], time_sync_times:list[tuple[float, float]]) -> None:
+    # Open files for streaming
+    output_file = mcap_log_file.removesuffix('.mcap') + '_synced.mcap'
+    with open(mcap_log_file, "rb") as input_f, open(output_file, "wb") as output_f:
+        reader = make_reader(input_f)
+        writer = Writer(output_f)
+        
+        header = reader.get_header()
+        source_profile = header.profile if header else ""
+        source_library = header.library if header else ""
+        print(f"Detected Source Profile: '{source_profile}' | Library: '{source_library}'")
+        writer.start(profile=source_profile, library=source_library)
+        
+        # Mappings to link input IDs to new output IDs
+        schema_id_map = {}
+        channel_id_map = {}
+        
+        print("Pass 1: Cloning file metadata structures...")
+        for schema_id, schema_record in reader.get_summary().schemas.items():
+            new_schema_id = writer.register_schema(
+                name=schema_record.name,
+                encoding=schema_record.encoding,
+                data=schema_record.data
+            )
+            schema_id_map[schema_id] = new_schema_id
+            
+        for channel_id, channel_record in reader.get_summary().channels.items():
+            new_schema_id = schema_id_map.get(channel_record.schema_id, 0)
+            
+            new_channel_id = writer.register_channel(
+                topic=channel_record.topic,
+                message_encoding=channel_record.message_encoding,
+                schema_id=new_schema_id,
+                metadata=channel_record.metadata
+            )
+            channel_id_map[channel_id] = new_channel_id
+
+
+        time_offset_ns = 60 * 60 * 1_000_000_000 
+        print("Pass 2: Rewriting messages with updated timestamps...")
+        for _, channel, message in reader.iter_messages():
+            new_publish_time = message.publish_time + time_offset_ns
+            
+            target_channel_id = channel_id_map[channel.id]
+
+            writer.add_message(
+                channel_id=target_channel_id,
+                log_time=message.log_time,
+                publish_time=new_publish_time,
+                data=message.data,
+                sequence=message.sequence
+            )
+            
+        writer.finish()
+        print(f"File writing finished successfully: {output_file}")
 
 def multiprocess() -> None:
     with Pool(processes=3) as pool:
