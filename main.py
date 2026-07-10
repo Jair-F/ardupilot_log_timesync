@@ -1,5 +1,6 @@
+import os
+import signal
 import sys
-
 from mcap.reader import make_reader
 from mcap.writer import Writer
 from multiprocessing import Pool
@@ -59,12 +60,11 @@ def read_bin_log_gps(bin_log_file:str) -> npt.NDArray[numpy.float64]:
             gwk = msg.GWk
             gps_synced_unixtime = gps_time_to_unix_time(gms, gwk)
 
-            # print(F"GPS: {time_us=} {nsats=} {hdop=} {gms} {gwk=}")
-
             ret.append((time_us, gps_synced_unixtime))
 
     if len(ret) == 0:
-        print("didnt found any GPS time in bin log - exiting")
+        print("didnt found any GPS time in bin log - exiting", flush=True)
+        os.kill(os.getppid(), signal.SIGTERM)
         sys.exit(-1)
 
     return numpy.array(ret)
@@ -142,7 +142,7 @@ def sync_mcap_timestamp(unixtime_pt_ns:int, rtt_times:npt.NDArray[numpy.float64]
         kind="linear", bounds_error=False, fill_value="extrapolate"
     )
 
-    autopilot_time_s = float(unix_to_autopilot(unixtime_pt_s)) #+ 31_536_000
+    autopilot_time_s = float(unix_to_autopilot(unixtime_pt_s))
 
     rtt_s = rtt_times[rtt_index][1]
     corrected_autopilot_time_s = autopilot_time_s - (rtt_s / 2.0)
