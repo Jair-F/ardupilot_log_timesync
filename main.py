@@ -25,7 +25,7 @@ def gps_time_to_unix_time(gms:int, gwk:int) -> float:
     return gps_synced_unixtime
 
 def read_bin_log_timesync(bin_log_file:str) -> npt.NDArray[numpy.float64]:
-    print("started reading bin log TIMESYNC")
+    print(F"started reading {bin_log_file} log TIMESYNC messages")
     ret:list[tuple[float, float]] = []
 
     log = mavutil.mavlink_connection(bin_log_file)
@@ -41,11 +41,11 @@ def read_bin_log_timesync(bin_log_file:str) -> npt.NDArray[numpy.float64]:
             ret.append((time_us, rtt))
             # print(f"Time: {time_us}, RTT: {rtt}")
     
-    print("finished reading bin log TIMESYNC")
+    print(F"finished reading {bin_log_file} log TIMESYNC messages")
     return numpy.array(ret)
 
 def read_bin_log_gps(bin_log_file:str) -> npt.NDArray[numpy.float64]:
-    print("started reading bin log GPS time")
+    print(F"started reading {bin_log_file} log GPS messages")
     ret:list[tuple[float, float]] = []
 
     log = mavutil.mavlink_connection(bin_log_file)
@@ -73,11 +73,11 @@ def read_bin_log_gps(bin_log_file:str) -> npt.NDArray[numpy.float64]:
         os.kill(os.getppid(), signal.SIGTERM)
         sys.exit(-1)
 
-    print("finished reading bin log GPS time")
+    print(F"finished reading {bin_log_file} log GPS messages")
     return numpy.array(ret)
 
 def read_tlog(tlog_file:str) -> npt.NDArray[numpy.float64]:
-    print("started reading TLOG")
+    print(F"started reading {tlog_file} TIMESYNC messages")
     log = mavutil.mavlink_connection(tlog_file)
     ret:list[tuple[float, float]] = []
 
@@ -104,7 +104,7 @@ def read_tlog(tlog_file:str) -> npt.NDArray[numpy.float64]:
                 last_time_us = time_us
                 # print(f"TIMESYNC | unix_time(tc1): {unix_time}, time_us(ts1): {time_us}")
     
-    print("finished reading TLOG")
+    print(F"finished reading {tlog_file} TIMESYNC messages")
     return numpy.array(ret)
 
 def find_closes_index(value:float|int, start_index:int, sync_array:npt.NDArray[numpy.float64], compare_index:int = 0) -> int:
@@ -176,7 +176,6 @@ def sync_mcap_timestamp(unixtime_pt_ns:int, rtt_times:npt.NDArray[numpy.float64]
     return int(gps_unix_time_s * 1e9)
 
 def sync_mcap(mcap_log_file:str, rtt_times:npt.NDArray[numpy.float64], time_sync_times:npt.NDArray[numpy.float64], gps_sync_times:npt.NDArray[numpy.float64]) -> None:
-    # Open files for streaming
     output_file = mcap_log_file.removesuffix('.mcap') + '_synced.mcap'
     with open(mcap_log_file, "rb") as input_f, open(output_file, "wb") as output_f:
         reader = make_reader(input_f)
@@ -188,7 +187,6 @@ def sync_mcap(mcap_log_file:str, rtt_times:npt.NDArray[numpy.float64], time_sync
         print(f"Detected Source Profile: '{source_profile}' | Library: '{source_library}'")
         writer.start(profile=source_profile, library=source_library)
         
-        # Mappings to link input IDs to new output IDs
         schema_id_map = {}
         channel_id_map = {}
         
