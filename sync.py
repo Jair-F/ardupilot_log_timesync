@@ -227,6 +227,7 @@ def sync_mcap(
     time_sync_times: npt.NDArray[numpy.float64],
     gps_sync_times: npt.NDArray[numpy.float64],
 ) -> None:
+    # pylint: disable=too-many-locals
     output_file = mcap_log_file.removesuffix('.mcap') + '_synced.mcap'
     with open(mcap_log_file, 'rb') as input_f, open(output_file, 'wb') as output_f:
         reader = make_reader(input_f)
@@ -309,10 +310,10 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str) -> None:
             timesync_times = tlog_handle.get()
             gps_timesync_times = gps_handle.get()
 
-        except (MissingDataError, Exception) as e:
+        except (MissingDataError, Exception) as e:  # pylint: disable=broad-exception-caught
             print(
                 f'\n{Fore.RED}{Style.BRIGHT}[CRITICAL] Error or missing '
-                + 'packets detected. Terminating remaining background tasks...',
+                + f'packets detected. Terminating remaining background tasks... {e}',
                 flush=True,
             )
             pool.terminate()
