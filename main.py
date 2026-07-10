@@ -17,8 +17,8 @@ def read_bin_log(bin_log_file:str) -> npt.NDArray[numpy.float64]:
             break
 
         if msg.get_type() == 'TSYN':
-            time_us = msg.TimeUS
-            rtt = msg.RTT
+            time_us = msg.TimeUS / 1e6
+            rtt = msg.RTT / 1e6
             ret.append((time_us, rtt))
             # print(f"Time: {time_us}, RTT: {rtt}")
     
@@ -39,8 +39,8 @@ def read_tlog(tlog_file:str) -> npt.NDArray[numpy.float64]:
             if msg.tc1 == 0:
                 continue
             elif msg.tc1:
-                unix_time = msg.tc1
-                time_us = msg.ts1
+                unix_time = msg.tc1 / 1e9
+                time_us = msg.ts1 / 1e9
                 
                 # removing pixhawk restarts if there are
                 if last_time_us > time_us:
@@ -53,17 +53,16 @@ def read_tlog(tlog_file:str) -> npt.NDArray[numpy.float64]:
     
     return numpy.array(ret)
 
-def find_closes_index(value:float|int, start_index:int, sync_array:npt.NDArray[numpy.float64]) -> int:
+def find_closes_index(value:float|int, start_index:int, sync_array:npt.NDArray[numpy.float64], compare_index:int = 0) -> int:
     max_idx = len(sync_array) - 2
 
-    while start_index < max_idx and value < sync_array[start_index][0]:
+    while start_index < max_idx and value > sync_array[start_index+1][compare_index]:
         start_index += 1
     
     return start_index
 
 def map_rtt_timeus_to_unixtime(rtt_times:npt.NDArray[numpy.float64], time_sync_times:npt.NDArray[numpy.float64]) -> npt.NDArray[numpy.float64]:
     idx = 0
-    max_idx = len(time_sync_times) - 2
 
     for i, entry in enumerate(rtt_times):
         time_us = entry[0]
@@ -88,9 +87,21 @@ def map_rtt_timeus_to_unixtime(rtt_times:npt.NDArray[numpy.float64], time_sync_t
 def sync_mcap_timestamp(unixtime_pt_ns:int, rtt_times:npt.NDArray[numpy.float64], time_sync_times:npt.NDArray[numpy.float64]) -> int:
     unixtime_pt_s = float(unixtime_pt_ns) / 1e9
 
+    rtt_index = find_closes_index(unixtime_pt_s, 0, rtt_times)
+    time_sync_index = find_closes_index(unixtime_pt_s, 0, time_sync_times, compare_index=1)
 
+    unix_to_autopilot = interp1d(
+        (time_sync_times[time_sync_index][1], time_sync_times[time_sync_index+1][1]), 
+        (time_sync_times[time_sync_index][0], time_sync_times[time_sync_index+1][0]),
+        kind="linear", bounds_error=False, fill_value="extrapolate"
+    )
 
-    return int(unixtime_pt_s * 1e9)
+    autopilot_time_s = float(unix_to_autopilot(unixtime_pt_s)) + 31_536_000
+
+    rtt_s = rtt_times[rtt_index][1]
+    corrected_autopilot_time_s = autopilot_time_s - (rtt_s / 2.0)
+
+    return int(corrected_autopilot_time_s * 1e9)
 
 def sync_mcap(mcap_log_file:str, rtt_times:npt.NDArray[numpy.float64], time_sync_times:npt.NDArray[numpy.float64]) -> None:
     # Open files for streaming
@@ -133,8 +144,10 @@ def sync_mcap(mcap_log_file:str, rtt_times:npt.NDArray[numpy.float64], time_sync
         # time_offset_ns = 60 * 60 * 1_000_000_000 
         print("Pass 2: Rewriting messages with updated timestamps...")
         for _, channel, message in reader.iter_messages():
+            # print(F"mcap message publish time: {message.publish_time}")
             new_publish_time = sync_mcap_timestamp(message.publish_time, rtt_times, time_sync_times)
-            
+            # print(F"mcap message synced publish time: {new_publish_time}")
+
             target_channel_id = channel_id_map[channel.id]
 
             writer.add_message(
@@ -165,6 +178,7 @@ def multiprocess() -> None:
         print(timesync_times)
 
     rtt_times = map_rtt_timeus_to_unixtime(rtt_times, timesync_times)
+    # timesync_times_unix_first = timesync_times[:, [1, 0]] # flipp the array - prev: (time_us, unix_time), now: (unix_time, time_us)
     print(rtt_times, end='\n\n\n')
     sync_mcap("logs/log.mcap", rtt_times, timesync_times)
 
