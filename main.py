@@ -2,8 +2,11 @@ from mcap.reader import make_reader
 from mcap.writer import Writer
 from multiprocessing import Pool
 from pymavlink import mavutil
+from scipy.interpolate import interp1d
+import numpy
+import numpy.typing as npt
 
-def read_bin_log(bin_log_file:str) -> None:
+def read_bin_log(bin_log_file:str) -> npt.NDArray[numpy.float64]:
     ret:list[tuple[float, float]] = []
 
     log = mavutil.mavlink_connection(bin_log_file)
@@ -19,9 +22,9 @@ def read_bin_log(bin_log_file:str) -> None:
             ret.append((time_us, rtt))
             # print(f"Time: {time_us}, RTT: {rtt}")
     
-    return ret
+    return numpy.array(ret)
 
-def read_tlog(tlog_file:str) -> None:
+def read_tlog(tlog_file:str) -> npt.NDArray[numpy.float64]:
     log = mavutil.mavlink_connection(tlog_file)
     ret:list[tuple[float, float]] = []
 
@@ -48,9 +51,34 @@ def read_tlog(tlog_file:str) -> None:
                 last_time_us = time_us
                 # print(f"TIMESYNC | unix_time(tc1): {unix_time}, time_us(ts1): {time_us}")
     
-    return ret
+    return numpy.array(ret)
 
-def sync_mcap(mcap_log_file:str, rtt_times:list[tuple[float, float]], time_sync_times:list[tuple[float, float]]) -> None:
+def map_rtt_timeus_to_unixtime(rtt_times:npt.NDArray[numpy.float64], time_sync_times:npt.NDArray[numpy.float64]) -> npt.NDArray[numpy.float64]:
+    idx = 0
+    max_idx = len(time_sync_times) - 2
+
+    for i, entry in enumerate(rtt_times):
+        time_us = entry[0]
+        # rtt = entry[1]
+
+        while idx < max_idx and time_us < time_sync_times[idx][0]:
+            idx += 1
+
+        interp_func = interp1d(
+            (time_sync_times[idx][0], time_sync_times[idx+1][0]), 
+            (time_sync_times[idx][1], time_sync_times[idx+1][1]), 
+            kind="linear", 
+            bounds_error=False, 
+            fill_value="extrapolate"
+        )
+
+        interpolated_unix = float(interp_func(time_us))
+
+        rtt_times[i, 0] = interpolated_unix
+
+    return rtt_times
+
+def sync_mcap(mcap_log_file:str, rtt_times:npt.NDArray[numpy.float64], time_sync_times:npt.NDArray[numpy.float64]) -> None:
     # Open files for streaming
     output_file = mcap_log_file.removesuffix('.mcap') + '_synced.mcap'
     with open(mcap_log_file, "rb") as input_f, open(output_file, "wb") as output_f:
@@ -107,18 +135,24 @@ def sync_mcap(mcap_log_file:str, rtt_times:list[tuple[float, float]], time_sync_
         print(f"File writing finished successfully: {output_file}")
 
 def multiprocess() -> None:
+    rtt_times:npt.NDArray[numpy.float64]
+    timesync_times:npt.NDArray[numpy.float64]
+
     with Pool(processes=3) as pool:
         print("reading bin log")
         read_bin_handle = pool.apply_async(read_bin_log, args=('logs/00000018.BIN',))
         print("reading tlog")
         read_tlog_handle = pool.apply_async(read_tlog, args=('logs/2026-05-23 19-06-38.tlog',))
 
-        ret_bin = read_bin_handle.get()
-        ret_tlog = read_tlog_handle.get()
+        rtt_times = read_bin_handle.get()
+        timesync_times = read_tlog_handle.get()
 
-        print(ret_bin, end='\n\n\n')
-        print(ret_tlog)
+        print(rtt_times, end='\n\n\n')
+        print(timesync_times)
+
+    rtt_times = map_rtt_timeus_to_unixtime(rtt_times, timesync_times)
+    print(rtt_times, end='\n\n\n')
+    sync_mcap("logs/log.mcap", rtt_times, timesync_times)
 
 if __name__ == "__main__":
     multiprocess()
-    
