@@ -13,6 +13,7 @@ A typical setup for logging a robot/drone flight ends up with three logs that ea
 | `.mcap` | Companion computer | Its own local system unix clock |
 
 None of these clocks agree with each other, and system clocks can drift or simply be wrong if the machine isn't NTP-synced. The one clock you *can* trust is GPS time, which only shows up in the autopilot log. This tool chains all three logs together so the messages in your `.mcap` file end up stamped with GPS-derived unix time instead of whatever the recording computer's clock happened to say.
+Saves the synchronized time in the **publish_time** of the .mcap log.
 
 ## How it works
 
@@ -22,7 +23,7 @@ flowchart LR
     B[".BIN log\nGPS messages"] -->|autopilot time ↔ GPS unix time| D
     C[".tlog\nTIMESYNC messages"] -->|autopilot time ↔ GCS unix time| D
     E[".mcap\noriginal timestamps"] --> D
-    D --> F[".mcap\nGPS-synced timestamps"]
+    D --> F[".mcap\nGPS-synced timestamps(publish_time)"]
 ```
 
 For every message in the `.mcap` file:
@@ -53,7 +54,7 @@ Example:
 ./sync.py logs/00000001.BIN logs/flight.tlog logs/log.mcap
 ```
 
-This produces `logs/log_synced.mcap` alongside the original file.
+This produces `logs/log_synced.mcap` alongside the original file where the synced time series is stored in the **publish_time**.
 
 ## Building a standalone binary
 
