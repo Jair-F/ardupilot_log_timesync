@@ -1,7 +1,5 @@
 #!/bin/python3
 import argparse
-import os
-import signal
 import sys
 import time
 from mcap.reader import make_reader
@@ -12,6 +10,9 @@ from scipy.interpolate import interp1d
 from astropy.time import Time, TimeDelta
 import numpy
 import numpy.typing as npt
+
+class MissingDataError(Exception):
+    pass
 
 def gps_time_to_unix_time(gms:int, gwk:int) -> float:
     seconds_per_week = 7 * 24 * 60 * 60
@@ -24,7 +25,7 @@ def gps_time_to_unix_time(gms:int, gwk:int) -> float:
     gps_synced_unixtime = t_final.unix
     return gps_synced_unixtime
 
-def read_bin_log_timesync(bin_log_file:str) -> npt.NDArray[numpy.float64]:
+def read_bin_log_timesync_rtt(bin_log_file:str) -> npt.NDArray[numpy.float64]:
     print(F"started reading {bin_log_file} log TIMESYNC messages")
     ret:list[tuple[float, float]] = []
 
@@ -39,8 +40,11 @@ def read_bin_log_timesync(bin_log_file:str) -> npt.NDArray[numpy.float64]:
             time_us = msg.TimeUS / 1e6
             rtt = msg.RTT / 1e6
             ret.append((time_us, rtt))
-            # print(f"Time: {time_us}, RTT: {rtt}")
     
+    if len(ret) < 2:
+        print("didnt found any TSYN in bin log - exiting", flush=True)
+        raise MissingDataError("Missing TSYN in BIN log")
+
     print(F"finished reading {bin_log_file} log TIMESYNC messages")
     return numpy.array(ret)
 
@@ -68,10 +72,10 @@ def read_bin_log_gps(bin_log_file:str) -> npt.NDArray[numpy.float64]:
 
             ret.append((time_us, gps_synced_unixtime))
 
-    if len(ret) == 0:
+    if len(ret) < 2:
         print("didnt found any GPS time in bin log - exiting", flush=True)
-        os.kill(os.getppid(), signal.SIGTERM)
-        sys.exit(-1)
+        raise MissingDataError("Missing GPS in BIN log")
+
 
     print(F"finished reading {bin_log_file} log GPS messages")
     return numpy.array(ret)
@@ -102,8 +106,11 @@ def read_tlog(tlog_file:str) -> npt.NDArray[numpy.float64]:
 
                 ret.append((time_us, unix_time))
                 last_time_us = time_us
-                # print(f"TIMESYNC | unix_time(tc1): {unix_time}, time_us(ts1): {time_us}")
     
+    if len(ret) < 2:
+        print("didnt found any TIMESYNC in tlog - exiting", flush=True)
+        raise MissingDataError("Missing TIMESYNC in tlog")
+
     print(F"finished reading {tlog_file} TIMESYNC messages")
     return numpy.array(ret)
 
@@ -184,7 +191,7 @@ def sync_mcap(mcap_log_file:str, rtt_times:npt.NDArray[numpy.float64], time_sync
         header = reader.get_header()
         source_profile = header.profile if header else ""
         source_library = header.library if header else ""
-        print(f"Detected Source Profile: '{source_profile}' | Library: '{source_library}'")
+        print(f"\nDetected Source Profile: '{source_profile}' | Library: '{source_library}'")
         writer.start(profile=source_profile, library=source_library)
         
         schema_id_map = {}
@@ -232,21 +239,41 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str) -> None:
     rtt_times:npt.NDArray[numpy.float64]
     timesync_times:npt.NDArray[numpy.float64]
 
-    with Pool(processes=3) as pool:
-        read_bin_timesync_handle = pool.apply_async(read_bin_log_timesync, args=(bin_path,))
-        read_bin_gps_handle = pool.apply_async(read_bin_log_gps, args=(bin_path,))
-        read_tlog_handle = pool.apply_async(read_tlog, args=(tlog_path,))
+    pool = Pool(processes=3)
+    try:
+        rtt_handle = pool.apply_async(read_bin_log_timesync_rtt, args=(bin_path,))
+        gps_handle = pool.apply_async(read_bin_log_gps, args=(bin_path,))
+        tlog_handle = pool.apply_async(read_tlog, args=(tlog_path,))
 
-        rtt_times = read_bin_timesync_handle.get()
-        timesync_times = read_tlog_handle.get()
-        gps_timesync_times = read_bin_gps_handle.get()
+        handles = [rtt_handle, gps_handle, tlog_handle]
 
-        # print(rtt_times, end='\n\n\n')
-        # print(timesync_times)
+        while not all(h.ready() for h in handles):
+            for h in handles:
+                if h.ready():
+                    if h.get() is None:
+                        print("\n[CRITICAL] Fast-failing due to missing tracking packets. Terminating remaining workers...", flush=True)
+                        pool.terminate()
+                        pool.join()
+                        sys.exit(-1)
+            time.sleep(0.1)
+
+        rtt_times = rtt_handle.get()
+        timesync_times = tlog_handle.get()
+        gps_timesync_times = gps_handle.get()
+
+    except (MissingDataError, Exception) as e:
+        print("\n[CRITICAL] Error or missing packets detected. Terminating remaining background tasks...", flush=True)
+        pool.terminate()
+        pool.join()
+        sys.exit(1)
+    else:
+        pool.close()
+        pool.join()
+
+    if rtt_times is None or gps_timesync_times is None or timesync_times is None:
+        sys.exit(1)
 
     rtt_times = map_rtt_timeus_to_unixtime(rtt_times, timesync_times)
-    # timesync_times_unix_first = timesync_times[:, [1, 0]] # flipp the array - prev: (time_us, unix_time), now: (unix_time, time_us)
-    # print(rtt_times, end='\n\n\n')
     sync_mcap(mcap_path, rtt_times, timesync_times, gps_timesync_times)
 
 def main() -> None:
@@ -255,14 +282,14 @@ def main() -> None:
     parser.add_argument("bin_path", type=str, help="Path to the input .BIN file")
     parser.add_argument("tlog_path", type=str, help="Path to the input .tlog file")
     
-    parser.add_argument("-o", "--output", type=str, default="logs/log_synced.mcap", 
-                        help="Path to the output .mcap file (default: logs/log_synced.mcap)")
+    parser.add_argument("mcap", type=str, default="logs/log.mcap", 
+                        help="Path to the .mcap file (default: logs/log.mcap)")
 
     args = parser.parse_args()
     sync_parallel(
         bin_path=args.bin_path,
         tlog_path=args.tlog_path,
-        mcap_path=args.output,
+        mcap_path=args.mcap,
     )
 
 if __name__ == "__main__":
@@ -270,4 +297,4 @@ if __name__ == "__main__":
     main()
     end = time.time()
     runtime_s = end - start
-    print(F"Finished syncing logs. Took {runtime_s:.2f}s.")
+    print(F"\nFinished syncing logs. Took {runtime_s:.2f}s.")
