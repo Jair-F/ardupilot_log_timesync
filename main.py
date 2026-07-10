@@ -11,6 +11,10 @@ from astropy.time import Time, TimeDelta
 import numpy
 import numpy.typing as npt
 
+from colorama import init, Fore, Style
+
+init(autoreset=True)
+
 class MissingDataError(Exception):
     pass
 
@@ -26,7 +30,7 @@ def gps_time_to_unix_time(gms:int, gwk:int) -> float:
     return gps_synced_unixtime
 
 def read_bin_log_timesync_rtt(bin_log_file:str) -> npt.NDArray[numpy.float64]:
-    print(F"started reading {bin_log_file} log TIMESYNC messages")
+    print(f"{Fore.CYAN}Started reading {bin_log_file} log TIMESYNC messages")
     ret:list[tuple[float, float]] = []
 
     log = mavutil.mavlink_connection(bin_log_file)
@@ -42,14 +46,14 @@ def read_bin_log_timesync_rtt(bin_log_file:str) -> npt.NDArray[numpy.float64]:
             ret.append((time_us, rtt))
     
     if len(ret) < 2:
-        print("didnt found any TSYN in bin log - exiting", flush=True)
+        print(f"{Fore.RED}Didn't find any TSYN in bin log - exiting", flush=True)
         raise MissingDataError("Missing TSYN in BIN log")
 
-    print(F"finished reading {bin_log_file} log TIMESYNC messages")
+    print(f"{Fore.GREEN}Finished reading {bin_log_file} log TIMESYNC messages")
     return numpy.array(ret)
 
 def read_bin_log_gps(bin_log_file:str) -> npt.NDArray[numpy.float64]:
-    print(F"started reading {bin_log_file} log GPS messages")
+    print(f"{Fore.CYAN}Started reading {bin_log_file} log GPS messages")
     ret:list[tuple[float, float]] = []
 
     log = mavutil.mavlink_connection(bin_log_file)
@@ -73,15 +77,14 @@ def read_bin_log_gps(bin_log_file:str) -> npt.NDArray[numpy.float64]:
             ret.append((time_us, gps_synced_unixtime))
 
     if len(ret) < 2:
-        print("didnt found any GPS time in bin log - exiting", flush=True)
+        print(f"{Fore.RED}Didn't find any GPS time in bin log - exiting", flush=True)
         raise MissingDataError("Missing GPS in BIN log")
 
-
-    print(F"finished reading {bin_log_file} log GPS messages")
+    print(f"{Fore.GREEN}Finished reading {bin_log_file} log GPS messages")
     return numpy.array(ret)
 
 def read_tlog(tlog_file:str) -> npt.NDArray[numpy.float64]:
-    print(F"started reading {tlog_file} TIMESYNC messages")
+    print(f"{Fore.CYAN}Started reading {tlog_file} TIMESYNC messages")
     log = mavutil.mavlink_connection(tlog_file)
     ret:list[tuple[float, float]] = []
 
@@ -95,23 +98,23 @@ def read_tlog(tlog_file:str) -> npt.NDArray[numpy.float64]:
         if msg.get_type() == 'TIMESYNC':
             if msg.tc1 == 0:
                 continue
-            elif msg.tc1:
+            elif msg.tc1 != 0 and msg.ts1 != 0:
                 unix_time = msg.tc1 / 1e9
                 time_us = msg.ts1 / 1e9
                 
                 # removing pixhawk restarts if there are
                 if last_time_us > time_us:
-                    print(F"Pixhawk restart at(removing) TimeUS: {time_us} - UnixTime: {unix_time}")
+                    print(f"{Fore.YELLOW}Pixhawk restart at(removing) TimeUS: {time_us} - UnixTime: {unix_time}")
                     ret = []
 
                 ret.append((time_us, unix_time))
                 last_time_us = time_us
     
     if len(ret) < 2:
-        print("didnt found any TIMESYNC in tlog - exiting", flush=True)
+        print(f"{Fore.RED}Didn't find any TIMESYNC in tlog - exiting", flush=True)
         raise MissingDataError("Missing TIMESYNC in tlog")
 
-    print(F"finished reading {tlog_file} TIMESYNC messages")
+    print(f"{Fore.GREEN}Finished reading {tlog_file} TIMESYNC messages")
     return numpy.array(ret)
 
 def find_closes_index(value:float|int, start_index:int, sync_array:npt.NDArray[numpy.float64], compare_index:int = 0) -> int:
@@ -191,13 +194,13 @@ def sync_mcap(mcap_log_file:str, rtt_times:npt.NDArray[numpy.float64], time_sync
         header = reader.get_header()
         source_profile = header.profile if header else ""
         source_library = header.library if header else ""
-        print(f"\nDetected Source Profile: '{source_profile}' | Library: '{source_library}'")
+        print(f"\n{Fore.MAGENTA}Detected Source Profile: '{source_profile}' | Library: '{source_library}'")
         writer.start(profile=source_profile, library=source_library)
         
         schema_id_map = {}
         channel_id_map = {}
         
-        print("Pass 1: Cloning file metadata structures...")
+        print(f"{Fore.BLUE}Pass 1: Cloning file metadata structures...")
         for schema_id, schema_record in reader.get_summary().schemas.items():
             new_schema_id = writer.register_schema(
                 name=schema_record.name,
@@ -218,7 +221,7 @@ def sync_mcap(mcap_log_file:str, rtt_times:npt.NDArray[numpy.float64], time_sync
             channel_id_map[channel_id] = new_channel_id
 
 
-        print("Pass 2: Rewriting messages with updated timestamps...")
+        print(f"{Fore.BLUE}Pass 2: Rewriting messages with updated timestamps...")
         for _, channel, message in reader.iter_messages():
             new_publish_time = sync_mcap_timestamp(message.publish_time, rtt_times, time_sync_times, gps_sync_times)
 
@@ -233,7 +236,7 @@ def sync_mcap(mcap_log_file:str, rtt_times:npt.NDArray[numpy.float64], time_sync
             )
             
         writer.finish()
-        print(f"File writing finished successfully: {output_file}")
+        print(f"{Fore.GREEN}{Style.BRIGHT}File writing finished successfully: {output_file}")
 
 def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str) -> None:
     rtt_times:npt.NDArray[numpy.float64]
@@ -251,7 +254,7 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str) -> None:
             for h in handles:
                 if h.ready():
                     if h.get() is None:
-                        print("\n[CRITICAL] Fast-failing due to missing tracking packets. Terminating remaining workers...", flush=True)
+                        print(f"\n{Fore.RED}{Style.BRIGHT}[CRITICAL] Fast-failing due to missing tracking packets. Terminating remaining workers...", flush=True)
                         pool.terminate()
                         pool.join()
                         sys.exit(-1)
@@ -262,7 +265,7 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str) -> None:
         gps_timesync_times = gps_handle.get()
 
     except (MissingDataError, Exception) as e:
-        print("\n[CRITICAL] Error or missing packets detected. Terminating remaining background tasks...", flush=True)
+        print(f"\n{Fore.RED}{Style.BRIGHT}[CRITICAL] Error or missing packets detected. Terminating remaining background tasks...", flush=True)
         pool.terminate()
         pool.join()
         sys.exit(1)
@@ -297,4 +300,4 @@ if __name__ == "__main__":
     main()
     end = time.time()
     runtime_s = end - start
-    print(F"\nFinished syncing logs. Took {runtime_s:.2f}s.")
+    print(f"\n{Fore.GREEN}{Style.BRIGHT}Finished syncing logs. Took {runtime_s:.2f}s.")
