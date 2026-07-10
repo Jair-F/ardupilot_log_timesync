@@ -5,5 +5,5 @@ RUN sudo apt update && sudo apt upgrade -y
 RUN sudo apt install -y python3 python3-pip git gpg tmux
 
 
-COPY requirements.txt .
-RUN sudo uv pip install --system --break-system-packages -r requirements.txt
+COPY pyproject.toml .
+RUN sudo uv pip install --system --break-system-packages -r pyproject.toml
