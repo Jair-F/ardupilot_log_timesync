@@ -1,6 +1,9 @@
+#!/bin/python3
+import argparse
 import os
 import signal
 import sys
+import time
 from mcap.reader import make_reader
 from mcap.writer import Writer
 from multiprocessing import Pool
@@ -22,6 +25,7 @@ def gps_time_to_unix_time(gms:int, gwk:int) -> float:
     return gps_synced_unixtime
 
 def read_bin_log_timesync(bin_log_file:str) -> npt.NDArray[numpy.float64]:
+    print("started reading bin log TIMESYNC")
     ret:list[tuple[float, float]] = []
 
     log = mavutil.mavlink_connection(bin_log_file)
@@ -37,9 +41,11 @@ def read_bin_log_timesync(bin_log_file:str) -> npt.NDArray[numpy.float64]:
             ret.append((time_us, rtt))
             # print(f"Time: {time_us}, RTT: {rtt}")
     
+    print("finished reading bin log TIMESYNC")
     return numpy.array(ret)
 
 def read_bin_log_gps(bin_log_file:str) -> npt.NDArray[numpy.float64]:
+    print("started reading bin log GPS time")
     ret:list[tuple[float, float]] = []
 
     log = mavutil.mavlink_connection(bin_log_file)
@@ -67,9 +73,11 @@ def read_bin_log_gps(bin_log_file:str) -> npt.NDArray[numpy.float64]:
         os.kill(os.getppid(), signal.SIGTERM)
         sys.exit(-1)
 
+    print("finished reading bin log GPS time")
     return numpy.array(ret)
 
 def read_tlog(tlog_file:str) -> npt.NDArray[numpy.float64]:
+    print("started reading TLOG")
     log = mavutil.mavlink_connection(tlog_file)
     ret:list[tuple[float, float]] = []
 
@@ -96,6 +104,7 @@ def read_tlog(tlog_file:str) -> npt.NDArray[numpy.float64]:
                 last_time_us = time_us
                 # print(f"TIMESYNC | unix_time(tc1): {unix_time}, time_us(ts1): {time_us}")
     
+    print("finished reading TLOG")
     return numpy.array(ret)
 
 def find_closes_index(value:float|int, start_index:int, sync_array:npt.NDArray[numpy.float64], compare_index:int = 0) -> int:
@@ -129,12 +138,8 @@ def map_rtt_timeus_to_unixtime(rtt_times:npt.NDArray[numpy.float64], time_sync_t
 
     return rtt_times
 
-def sync_mcap_timestamp(unixtime_pt_ns:int, rtt_times:npt.NDArray[numpy.float64], gcs_time_sync_times:npt.NDArray[numpy.float64],
-                        gps_sync_times:npt.NDArray[numpy.float64]) -> int:
-    unixtime_pt_s = float(unixtime_pt_ns) / 1e9
-
-    rtt_index = find_closes_index(unixtime_pt_s, 0, rtt_times)
-    time_sync_index = find_closes_index(unixtime_pt_s, 0, gcs_time_sync_times, compare_index=1)
+def map_unix_time_to_autopilot_timeus_s(unix_time_point:float, gcs_time_sync_times:npt.NDArray[numpy.float64]) -> float:
+    time_sync_index = find_closes_index(unix_time_point, 0, gcs_time_sync_times, compare_index=1)
 
     unix_to_autopilot = interp1d(
         (gcs_time_sync_times[time_sync_index][1], gcs_time_sync_times[time_sync_index+1][1]), 
@@ -142,18 +147,31 @@ def sync_mcap_timestamp(unixtime_pt_ns:int, rtt_times:npt.NDArray[numpy.float64]
         kind="linear", bounds_error=False, fill_value="extrapolate"
     )
 
-    autopilot_time_s = float(unix_to_autopilot(unixtime_pt_s))
+    autopilot_time_s = float(unix_to_autopilot(unix_time_point))
+    return autopilot_time_s
 
-    rtt_s = rtt_times[rtt_index][1]
-    corrected_autopilot_time_s = autopilot_time_s - (rtt_s / 2.0)
-
-    gps_sync_index = find_closes_index(corrected_autopilot_time_s, 0, gps_sync_times)
+def map_autopilot_timeus_to_gps_unixtime_s(autopilot_timeus_s:float,gcs_time_sync_times:npt.NDArray[numpy.float64],  gps_sync_times:npt.NDArray[numpy.float64]) -> float:
+    gps_sync_index = find_closes_index(autopilot_timeus_s, 0, gps_sync_times)
     unix_to_autopilot = interp1d(
         (gps_sync_times[gps_sync_index][0], gcs_time_sync_times[gps_sync_index+1][0]), 
         (gcs_time_sync_times[gps_sync_index][1], gcs_time_sync_times[gps_sync_index+1][1]),
         kind="linear", bounds_error=False, fill_value="extrapolate"
     )
-    gps_unix_time_s = float(unix_to_autopilot(corrected_autopilot_time_s))
+
+    gps_unix_time_s = float(unix_to_autopilot(autopilot_timeus_s))
+    return gps_unix_time_s
+
+def sync_mcap_timestamp(unixtime_pt_ns:int, rtt_times:npt.NDArray[numpy.float64], gcs_time_sync_times:npt.NDArray[numpy.float64],
+                        gps_sync_times:npt.NDArray[numpy.float64]) -> int:
+    unixtime_pt_s = float(unixtime_pt_ns) / 1e9
+
+    rtt_index = find_closes_index(unixtime_pt_s, 0, rtt_times)
+    rtt_s = rtt_times[rtt_index][1]
+    
+    autopilot_time_s = map_unix_time_to_autopilot_timeus_s(unixtime_pt_s, gcs_time_sync_times)
+    corrected_autopilot_time_s = autopilot_time_s - (rtt_s / 2.0)
+
+    gps_unix_time_s = map_autopilot_timeus_to_gps_unixtime_s(corrected_autopilot_time_s, gcs_time_sync_times, gps_sync_times)
 
     return int(gps_unix_time_s * 1e9)
 
@@ -195,12 +213,9 @@ def sync_mcap(mcap_log_file:str, rtt_times:npt.NDArray[numpy.float64], time_sync
             channel_id_map[channel_id] = new_channel_id
 
 
-        # time_offset_ns = 60 * 60 * 1_000_000_000 
         print("Pass 2: Rewriting messages with updated timestamps...")
         for _, channel, message in reader.iter_messages():
-            # print(F"mcap message publish time: {message.publish_time}")
             new_publish_time = sync_mcap_timestamp(message.publish_time, rtt_times, time_sync_times, gps_sync_times)
-            # print(F"mcap message synced publish time: {new_publish_time}")
 
             target_channel_id = channel_id_map[channel.id]
 
@@ -215,29 +230,46 @@ def sync_mcap(mcap_log_file:str, rtt_times:npt.NDArray[numpy.float64], time_sync
         writer.finish()
         print(f"File writing finished successfully: {output_file}")
 
-def multiprocess() -> None:
+def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str) -> None:
     rtt_times:npt.NDArray[numpy.float64]
     timesync_times:npt.NDArray[numpy.float64]
 
     with Pool(processes=3) as pool:
-        print("reading bin log timesync")
-        read_bin_timesync_handle = pool.apply_async(read_bin_log_timesync, args=('logs/00000018.BIN',))
-        print("reading bin log gps time")
-        read_bin_gps_handle = pool.apply_async(read_bin_log_gps, args=('logs/00000018.BIN',))
-        print("reading tlog")
-        read_tlog_handle = pool.apply_async(read_tlog, args=('logs/2026-05-23 19-06-38.tlog',))
+        read_bin_timesync_handle = pool.apply_async(read_bin_log_timesync, args=(bin_path,))
+        read_bin_gps_handle = pool.apply_async(read_bin_log_gps, args=(bin_path,))
+        read_tlog_handle = pool.apply_async(read_tlog, args=(tlog_path,))
 
         rtt_times = read_bin_timesync_handle.get()
         timesync_times = read_tlog_handle.get()
         gps_timesync_times = read_bin_gps_handle.get()
 
-        print(rtt_times, end='\n\n\n')
-        print(timesync_times)
+        # print(rtt_times, end='\n\n\n')
+        # print(timesync_times)
 
     rtt_times = map_rtt_timeus_to_unixtime(rtt_times, timesync_times)
     # timesync_times_unix_first = timesync_times[:, [1, 0]] # flipp the array - prev: (time_us, unix_time), now: (unix_time, time_us)
-    print(rtt_times, end='\n\n\n')
-    sync_mcap("logs/log.mcap", rtt_times, timesync_times, gps_timesync_times)
+    # print(rtt_times, end='\n\n\n')
+    sync_mcap(mcap_path, rtt_times, timesync_times, gps_timesync_times)
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Multiprocess log file synchronizer.")
+
+    parser.add_argument("bin_path", type=str, help="Path to the input .BIN file")
+    parser.add_argument("tlog_path", type=str, help="Path to the input .tlog file")
+    
+    parser.add_argument("-o", "--output", type=str, default="logs/log_synced.mcap", 
+                        help="Path to the output .mcap file (default: logs/log_synced.mcap)")
+
+    args = parser.parse_args()
+    sync_parallel(
+        bin_path=args.bin_path,
+        tlog_path=args.tlog_path,
+        mcap_path=args.output,
+    )
 
 if __name__ == "__main__":
-    multiprocess()
+    start = time.time()
+    main()
+    end = time.time()
+    runtime_s = end - start
+    print(F"Finished syncing logs. Took {runtime_s:.2f}s.")
