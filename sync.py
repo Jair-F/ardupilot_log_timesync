@@ -283,44 +283,41 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str) -> None:
     rtt_times: npt.NDArray[numpy.float64]
     timesync_times: npt.NDArray[numpy.float64]
 
-    pool = Pool(processes=3)
-    try:
-        rtt_handle = pool.apply_async(read_bin_log_timesync_rtt, args=(bin_path,))
-        gps_handle = pool.apply_async(read_bin_log_gps, args=(bin_path,))
-        tlog_handle = pool.apply_async(read_tlog, args=(tlog_path,))
+    with Pool(processes=3) as pool:
+        try:
+            rtt_handle = pool.apply_async(read_bin_log_timesync_rtt, args=(bin_path,))
+            gps_handle = pool.apply_async(read_bin_log_gps, args=(bin_path,))
+            tlog_handle = pool.apply_async(read_tlog, args=(tlog_path,))
 
-        handles = [rtt_handle, gps_handle, tlog_handle]
+            handles = [rtt_handle, gps_handle, tlog_handle]
 
-        while not all(h.ready() for h in handles):
-            for h in handles:
-                if h.ready():
-                    if h.get() is None:
-                        print(
-                            f'\n{Fore.RED}{Style.BRIGHT}[CRITICAL] Fast-failing due to missing '
-                            + 'tracking packets. Terminating remaining workers...',
-                            flush=True,
-                        )
-                        pool.terminate()
-                        pool.join()
-                        sys.exit(-1)
-            time.sleep(0.1)
+            while not all(h.ready() for h in handles):
+                for h in handles:
+                    if h.ready():
+                        if h.get() is None:
+                            print(
+                                f'\n{Fore.RED}{Style.BRIGHT}[CRITICAL] Fast-failing due to missing '
+                                + 'tracking packets. Terminating remaining workers...',
+                                flush=True,
+                            )
+                            pool.terminate()
+                            pool.join()
+                            sys.exit(-1)
+                time.sleep(0.1)
 
-        rtt_times = rtt_handle.get()
-        timesync_times = tlog_handle.get()
-        gps_timesync_times = gps_handle.get()
+            rtt_times = rtt_handle.get()
+            timesync_times = tlog_handle.get()
+            gps_timesync_times = gps_handle.get()
 
-    except (MissingDataError, Exception) as e:
-        print(
-            f'\n{Fore.RED}{Style.BRIGHT}[CRITICAL] Error or missing '
-            + 'packets detected. Terminating remaining background tasks...',
-            flush=True,
-        )
-        pool.terminate()
-        pool.join()
-        sys.exit(1)
-    else:
-        pool.close()
-        pool.join()
+        except (MissingDataError, Exception) as e:
+            print(
+                f'\n{Fore.RED}{Style.BRIGHT}[CRITICAL] Error or missing '
+                + 'packets detected. Terminating remaining background tasks...',
+                flush=True,
+            )
+            pool.terminate()
+            pool.join()
+            sys.exit(1)
 
     if rtt_times is None or gps_timesync_times is None or timesync_times is None:
         sys.exit(1)
