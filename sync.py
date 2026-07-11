@@ -290,7 +290,7 @@ def sync_mcap(
 
         if not time_spans_overlapp and validate_times:
             print(
-                f"{Fore.RED}{Style.BRIGHT}Time Sync probably didn't work as expected -"
+                f"{Fore.RED}{Style.BRIGHT}Time Sync probably didn't work as expected - "
                 + ".tlog times and mcap don't share a common time section",
             )
 
