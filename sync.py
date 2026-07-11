@@ -2,7 +2,7 @@
 import argparse
 import sys
 import time
-from multiprocessing import Pool
+from multiprocessing.pool import Pool
 
 import argcomplete
 import numpy
@@ -14,25 +14,33 @@ from mcap.writer import CompressionType, Writer
 from pymavlink import mavutil
 from scipy.interpolate import interp1d
 
+SECONDS_PER_WEEK = 7 * 24 * 60 * 60
+MIN_REQUIRED_SAMPLES = 2
+
 
 class MissingDataError(Exception):
     pass
 
 
 def gps_time_to_unix_time(gms: int, gwk: int) -> float:
-    seconds_per_week = 7 * 24 * 60 * 60
-    gps_seconds_base = gwk * seconds_per_week
+    gps_week_start_seconds = gwk * SECONDS_PER_WEEK
 
-    t_base = Time(gps_seconds_base, format='gps')
-    dt = TimeDelta(gms / 1000.0, format='sec')
-    t_final = t_base + dt
+    week_start = Time(gps_week_start_seconds, format='gps')
+    offset = TimeDelta(gms / 1000.0, format='sec')
+    absolute_time = week_start + offset
 
-    return float(t_final.unix)
+    return float(absolute_time.unix)
+
+
+def _require_min_samples(samples: list[tuple[float, float]], log_file: str, message_type: str) -> None:
+    if len(samples) < MIN_REQUIRED_SAMPLES:
+        print(f"{Fore.RED}Didn't find any {message_type} in {log_file} - exiting", flush=True)
+        raise MissingDataError(f'Missing {message_type} in {log_file}')
 
 
 def read_bin_log_timesync_rtt(bin_log_file: str) -> npt.NDArray[numpy.float64]:
     print(f'Started reading {bin_log_file} log TIMESYNC messages')
-    ret: list[tuple[float, float]] = []
+    samples: list[tuple[float, float]] = []
 
     log = mavutil.mavlink_connection(bin_log_file)
     while True:
@@ -43,19 +51,17 @@ def read_bin_log_timesync_rtt(bin_log_file: str) -> npt.NDArray[numpy.float64]:
         if msg.get_type() == 'TSYN':
             time_us = msg.TimeUS / 1e6
             rtt = msg.RTT / 1e6
-            ret.append((time_us, rtt))
+            samples.append((time_us, rtt))
 
-    if len(ret) < 2:
-        print(f"{Fore.RED}Didn't find any TSYN in bin log - exiting", flush=True)
-        raise MissingDataError('Missing TSYN in BIN log')
+    _require_min_samples(samples, bin_log_file, 'TSYN')
 
     print(f'{Fore.GREEN}Finished reading {bin_log_file} log TIMESYNC messages')
-    return numpy.array(ret)
+    return numpy.array(samples)
 
 
 def read_bin_log_gps(bin_log_file: str) -> npt.NDArray[numpy.float64]:
     print(f'Started reading {bin_log_file} log GPS messages')
-    ret: list[tuple[float, float]] = []
+    samples: list[tuple[float, float]] = []
 
     log = mavutil.mavlink_connection(bin_log_file)
     while True:
@@ -63,26 +69,26 @@ def read_bin_log_gps(bin_log_file: str) -> npt.NDArray[numpy.float64]:
         if msg is None:
             break
 
-        if msg.get_type() == 'GPS':
-            if msg.HDop > 2.5 or msg.NSats < 4:
-                continue
+        if msg.get_type() != 'GPS':
+            continue
 
-            time_us = msg.TimeUS / 1e6
-            gps_synced_unixtime = gps_time_to_unix_time(msg.GMS, msg.GWk)
-            ret.append((time_us, gps_synced_unixtime))
+        if msg.HDop > 2.5 or msg.NSats < 4:
+            continue
 
-    if len(ret) < 2:
-        print(f"{Fore.RED}Didn't find any GPS time in bin log - exiting", flush=True)
-        raise MissingDataError('Missing GPS in BIN log')
+        time_us = msg.TimeUS / 1e6
+        gps_synced_unixtime = gps_time_to_unix_time(msg.GMS, msg.GWk)
+        samples.append((time_us, gps_synced_unixtime))
+
+    _require_min_samples(samples, bin_log_file, 'GPS time')
 
     print(f'{Fore.GREEN}Finished reading {bin_log_file} log GPS messages')
-    return numpy.array(ret)
+    return numpy.array(samples)
 
 
 def read_tlog(tlog_file: str) -> npt.NDArray[numpy.float64]:
     print(f'Started reading {tlog_file} TIMESYNC messages')
     log = mavutil.mavlink_connection(tlog_file)
-    ret: list[tuple[float, float]] = []
+    samples: list[tuple[float, float]] = []
 
     last_time_us = 0
     while True:
@@ -90,30 +96,30 @@ def read_tlog(tlog_file: str) -> npt.NDArray[numpy.float64]:
         if msg is None:
             break
 
-        if msg.get_type() == 'TIMESYNC':
-            if msg.tc1 == 0 or msg.ts1 == 0:
-                continue
+        if msg.get_type() != 'TIMESYNC':
+            continue
 
-            unix_time = msg.tc1 / 1e9
-            time_us = msg.ts1 / 1e9
+        if msg.tc1 == 0 or msg.ts1 == 0:
+            continue
 
-            # removing pixhawk restarts if there are
-            if last_time_us > time_us:
-                print(f'{Fore.YELLOW}Pixhawk restart at(removing) TimeUS: {time_us} - UnixTime: {unix_time}')
-                ret = []
+        unix_time = msg.tc1 / 1e9
+        time_us = msg.ts1 / 1e9
 
-            ret.append((time_us, unix_time))
-            last_time_us = time_us
+        # removing pixhawk restarts if there are
+        if last_time_us > time_us:
+            print(f'{Fore.YELLOW}Pixhawk restart at(removing) TimeUS: {time_us} - UnixTime: {unix_time}')
+            samples = []
 
-    if len(ret) < 2:
-        print(f"{Fore.RED}Didn't find any TIMESYNC in tlog - exiting", flush=True)
-        raise MissingDataError('Missing TIMESYNC in tlog')
+        samples.append((time_us, unix_time))
+        last_time_us = time_us
+
+    _require_min_samples(samples, tlog_file, 'TIMESYNC')
 
     print(f'{Fore.GREEN}Finished reading {tlog_file} TIMESYNC messages')
-    return numpy.array(ret)
+    return numpy.array(samples)
 
 
-def find_closes_index(
+def find_closest_index(
     value: float | int,
     start_index: int,
     sync_array: npt.NDArray[numpy.float64],
@@ -131,23 +137,20 @@ def map_rtt_timeus_to_unixtime(
     rtt_times: npt.NDArray[numpy.float64],
     time_sync_times: npt.NDArray[numpy.float64],
 ) -> npt.NDArray[numpy.float64]:
-    idx = 0
+    search_index = 0
 
-    for i, entry in enumerate(rtt_times):
-        time_us = entry[0]
-        # rtt = entry[1]
-
-        idx = find_closes_index(time_us, idx, time_sync_times)
+    for row_index, (time_us, _rtt) in enumerate(rtt_times):
+        search_index = find_closest_index(time_us, search_index, time_sync_times)
 
         interp_func = interp1d(
-            (time_sync_times[idx][0], time_sync_times[idx + 1][0]),
-            (time_sync_times[idx][1], time_sync_times[idx + 1][1]),
+            (time_sync_times[search_index][0], time_sync_times[search_index + 1][0]),
+            (time_sync_times[search_index][1], time_sync_times[search_index + 1][1]),
             kind='linear',
             bounds_error=False,
             fill_value='extrapolate',
         )
 
-        rtt_times[i, 0] = float(interp_func(time_us))
+        rtt_times[row_index, 0] = float(interp_func(time_us))
 
     return rtt_times
 
@@ -156,11 +159,11 @@ def map_unix_time_to_autopilot_timeus_s(
     unix_time_point: float,
     gcs_time_sync_times: npt.NDArray[numpy.float64],
 ) -> float:
-    time_sync_index = find_closes_index(unix_time_point, 0, gcs_time_sync_times, compare_index=1)
+    sync_index = find_closest_index(unix_time_point, 0, gcs_time_sync_times, compare_index=1)
 
     unix_to_autopilot = interp1d(
-        (gcs_time_sync_times[time_sync_index][1], gcs_time_sync_times[time_sync_index + 1][1]),
-        (gcs_time_sync_times[time_sync_index][0], gcs_time_sync_times[time_sync_index + 1][0]),
+        (gcs_time_sync_times[sync_index][1], gcs_time_sync_times[sync_index + 1][1]),
+        (gcs_time_sync_times[sync_index][0], gcs_time_sync_times[sync_index + 1][0]),
         kind='linear',
         bounds_error=False,
         fill_value='extrapolate',
@@ -174,7 +177,7 @@ def map_autopilot_timeus_to_gps_unixtime_s(
     gcs_time_sync_times: npt.NDArray[numpy.float64],
     gps_sync_times: npt.NDArray[numpy.float64],
 ) -> float:
-    gps_sync_index = find_closes_index(autopilot_timeus_s, 0, gps_sync_times)
+    gps_sync_index = find_closest_index(autopilot_timeus_s, 0, gps_sync_times)
     unix_to_autopilot = interp1d(
         (gps_sync_times[gps_sync_index][0], gcs_time_sync_times[gps_sync_index + 1][0]),
         (gcs_time_sync_times[gps_sync_index][1], gcs_time_sync_times[gps_sync_index + 1][1]),
@@ -195,7 +198,7 @@ def sync_mcap_timestamp(
     # pylint: disable=too-many-locals
     unixtime_pt_s = float(unixtime_pt_ns) / 1e9
 
-    rtt_index = find_closes_index(unixtime_pt_s, 0, rtt_times)
+    rtt_index = find_closest_index(unixtime_pt_s, 0, rtt_times)
     rtt_s = rtt_times[rtt_index][1]
 
     autopilot_time_s = map_unix_time_to_autopilot_timeus_s(unixtime_pt_s, gcs_time_sync_times)
@@ -219,6 +222,7 @@ def sync_mcap(
 ) -> None:
     # pylint: disable=too-many-locals
     output_file = mcap_log_file.removesuffix('.mcap') + '_synced.mcap'
+
     with open(mcap_log_file, 'rb') as input_f, open(output_file, 'wb') as output_f:
         reader = make_reader(input_f)
         writer = Writer(output_f, chunk_size=4 * 1024 * 1024, compression=CompressionType.ZSTD)
@@ -286,10 +290,16 @@ def sync_mcap(
 def check_if_time_spans_overlap(timesync_times: npt.NDArray[numpy.float64], old_publish_time: float) -> bool:
     if len(timesync_times) < 2:
         return False
-    # Clean vectorized check checking if target sits within any chronological sync window bounds
     low_bounds = timesync_times[:-2, 1]
     high_bounds = timesync_times[1:-1, 1]
     return bool(numpy.any((low_bounds < old_publish_time) & (old_publish_time < high_bounds)))
+
+
+def _fail_and_terminate(pool: Pool, message: str, exit_code: int) -> None:
+    print(message, flush=True)
+    pool.terminate()
+    pool.join()
+    sys.exit(exit_code)
 
 
 def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str, validate_times: bool = True) -> None:
@@ -304,14 +314,12 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str, validate_times:
             while not all(h.ready() for h in handles):
                 for h in handles:
                     if h.ready() and h.get() is None:
-                        print(
+                        _fail_and_terminate(
+                            pool,
                             f'\n{Fore.RED}{Style.BRIGHT}[CRITICAL] Fast-failing due to missing '
                             'tracking packets. Terminating remaining workers...',
-                            flush=True,
+                            -1,
                         )
-                        pool.terminate()
-                        pool.join()
-                        sys.exit(-1)
                 time.sleep(0.1)
 
             rtt_times = rtt_handle.get()
@@ -319,14 +327,12 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str, validate_times:
             gps_timesync_times = gps_handle.get()
 
         except (MissingDataError, Exception) as e:  # pylint: disable=broad-exception-caught
-            print(
+            _fail_and_terminate(
+                pool,
                 f'\n{Fore.RED}{Style.BRIGHT}[CRITICAL] Error or missing '
                 f'packets detected. Terminating remaining background tasks... {e}',
-                flush=True,
+                1,
             )
-            pool.terminate()
-            pool.join()
-            sys.exit(1)
 
     if rtt_times is None or gps_timesync_times is None or timesync_times is None:
         sys.exit(1)
