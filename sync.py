@@ -119,6 +119,39 @@ def read_tlog(tlog_file: str) -> npt.NDArray[numpy.float64]:
     return numpy.array(samples)
 
 
+def read_mcap_time_bounds(mcap_file: str) -> tuple[float, float]:
+    print(f'Started reading {mcap_file} time bounds')
+
+    with open(mcap_file, 'rb') as f:
+        reader = make_reader(f)
+        summary = reader.get_summary()
+
+        if summary is not None and summary.statistics is not None:
+            stats = summary.statistics
+            if stats.message_start_time and stats.message_end_time:
+                start_s = stats.message_start_time / 1e9
+                end_s = stats.message_end_time / 1e9
+                print(f'{Fore.GREEN}Finished reading {mcap_file} time bounds (from summary)')
+                return start_s, end_s
+
+        print(f'{Fore.YELLOW}No summary statistics found in {mcap_file}, falling back to full scan')
+
+    first_time_ns = None
+    last_time_ns = None
+    with open(mcap_file, 'rb') as f:
+        reader = make_reader(f)
+        for _, _, message in reader.iter_messages():
+            if first_time_ns is None:
+                first_time_ns = message.log_time
+            last_time_ns = message.log_time
+
+    if first_time_ns is None or last_time_ns is None:
+        raise MissingDataError(f'No messages found in {mcap_file}')
+
+    print(f'{Fore.GREEN}Finished reading {mcap_file} time bounds (from full scan)')
+    return first_time_ns / 1e9, last_time_ns / 1e9
+
+
 def find_closest_index(
     value: float | int,
     start_index: int,
@@ -208,7 +241,14 @@ def sync_mcap_timestamp(
         gps_sync_times,
     )
 
-    return int(gps_unix_time_s * 1e9)
+    new_time_ns = int(gps_unix_time_s * 1e9)
+    if not 0 <= new_time_ns <= 2**64 - 1:
+        pass
+    #     raise ValueError(
+    #         f'Computed out-of-range publish_time {new_time_ns} for input {unixtime_pt_ns} - '
+    #         'check that the .mcap and .tlog time ranges overlap (or are close enough to extrapolate safely)'
+    #     )
+    return new_time_ns
 
 
 def sync_mcap(
@@ -216,7 +256,6 @@ def sync_mcap(
     rtt_times: npt.NDArray[numpy.float64],
     timesync_times: npt.NDArray[numpy.float64],
     gps_sync_times: npt.NDArray[numpy.float64],
-    validate_times: bool,
 ) -> None:
     # pylint: disable=too-many-locals
     output_file = mcap_log_file.removesuffix('.mcap') + '_synced.mcap'
@@ -254,16 +293,9 @@ def sync_mcap(
             )
             channel_id_map[channel_id] = new_channel_id
 
-        time_spans_overlap = False
         print('Pass 2: Rewriting messages with updated timestamps...')
         for _, channel, message in reader.iter_messages():
-            old_publish_time = message.publish_time
-            new_publish_time = sync_mcap_timestamp(old_publish_time, rtt_times, timesync_times, gps_sync_times)
-
-            if validate_times and not time_spans_overlap:
-                time_spans_overlap = check_if_time_spans_overlap(timesync_times, old_publish_time / 1e9)
-                if time_spans_overlap:
-                    print(f'{Fore.GREEN}{Style.BRIGHT}Found overlapping time section in tlog and mcap time series')
+            new_publish_time = sync_mcap_timestamp(message.publish_time, rtt_times, timesync_times, gps_sync_times)
 
             target_channel_id = channel_id_map[channel.id]
 
@@ -278,19 +310,19 @@ def sync_mcap(
         writer.finish()
         print(f'{Fore.GREEN}{Style.BRIGHT}File writing finished successfully: {output_file}')
 
-        if not time_spans_overlap and validate_times:
-            print(
-                f"{Fore.RED}{Style.BRIGHT}[WARNING] Time Sync probably didn't work as expected - "
-                ".tlog times and mcap don't share a common time section",
-            )
 
-
-def check_if_time_spans_overlap(timesync_times: npt.NDArray[numpy.float64], old_publish_time: float) -> bool:
+def check_if_time_spans_overlap(
+    timesync_times: npt.NDArray[numpy.float64],
+    mcap_start_s: float,
+    mcap_end_s: float,
+) -> bool:
     if len(timesync_times) < 2:
         return False
-    low_bounds = timesync_times[:-2, 1]
-    high_bounds = timesync_times[1:-1, 1]
-    return bool(numpy.any((low_bounds < old_publish_time) & (old_publish_time < high_bounds)))
+
+    tlog_start_s = timesync_times[0][1]
+    tlog_end_s = timesync_times[-1][1]
+
+    return bool(mcap_start_s <= tlog_end_s and mcap_end_s >= tlog_start_s)
 
 
 def _fail_and_terminate(pool: Pool, message: str, exit_code: int) -> None:
@@ -301,6 +333,7 @@ def _fail_and_terminate(pool: Pool, message: str, exit_code: int) -> None:
 
 
 def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str, validate_times: bool = True) -> None:
+    # pylint: disable=too-many-locals
     with Pool(processes=3) as pool:
         try:
             rtt_handle = pool.apply_async(read_bin_log_timesync_rtt, args=(bin_path,))
@@ -337,8 +370,29 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str, validate_times:
     if rtt_times is None or gps_timesync_times is None or timesync_times is None:
         sys.exit(1)
 
+    if validate_times:
+        mcap_start_s, mcap_end_s = read_mcap_time_bounds(mcap_path)
+        validate_times_overlap(timesync_times, mcap_start_s, mcap_end_s)
+
     rtt_times = map_rtt_timeus_to_unixtime(rtt_times, timesync_times)
-    sync_mcap(mcap_path, rtt_times, timesync_times, gps_timesync_times, validate_times)
+    sync_mcap(mcap_path, rtt_times, timesync_times, gps_timesync_times)
+
+
+def validate_times_overlap(
+    timesync_times: npt.NDArray[numpy.float64],
+    mcap_start_s: float,
+    mcap_end_s: float,
+) -> None:
+    if check_if_time_spans_overlap(timesync_times, mcap_start_s, mcap_end_s):
+        print(f'{Fore.GREEN}{Style.BRIGHT}Found overlapping time section in tlog and mcap time series')
+        return
+
+    tlog_start_s, tlog_end_s = timesync_times[0][1], timesync_times[-1][1]
+    print(
+        f"{Fore.RED}{Style.BRIGHT}[WARNING] Time Sync probably didn't work as expected - "
+        f'.tlog ({tlog_start_s:.1f} - {tlog_end_s:.1f}) and mcap ({mcap_start_s:.1f} - {mcap_end_s:.1f}) '
+        "don't share a common time section",
+    )
 
 
 def main() -> None:
