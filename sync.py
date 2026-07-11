@@ -174,13 +174,12 @@ def map_unix_time_to_autopilot_timeus_s(
 
 def map_autopilot_timeus_to_gps_unixtime_s(
     autopilot_timeus_s: float,
-    gcs_time_sync_times: npt.NDArray[numpy.float64],
     gps_sync_times: npt.NDArray[numpy.float64],
 ) -> float:
     gps_sync_index = find_closest_index(autopilot_timeus_s, 0, gps_sync_times)
     unix_to_autopilot = interp1d(
-        (gps_sync_times[gps_sync_index][0], gcs_time_sync_times[gps_sync_index + 1][0]),
-        (gcs_time_sync_times[gps_sync_index][1], gcs_time_sync_times[gps_sync_index + 1][1]),
+        (gps_sync_times[gps_sync_index][0], gps_sync_times[gps_sync_index + 1][0]),
+        (gps_sync_times[gps_sync_index][1], gps_sync_times[gps_sync_index + 1][1]),
         kind='linear',
         bounds_error=False,
         fill_value='extrapolate',
@@ -206,7 +205,6 @@ def sync_mcap_timestamp(
 
     gps_unix_time_s = map_autopilot_timeus_to_gps_unixtime_s(
         corrected_autopilot_time_s,
-        gcs_time_sync_times,
         gps_sync_times,
     )
 
