@@ -1,21 +1,16 @@
 # ArduPilot Log Timesync
 
-Rewrite the timestamps in an MCAP log so they match GPS-accurate time — cross-referenced from an ArduPilot dataflash log (`.BIN`) and a ground-control-station telemetry log (`.tlog`).
+Synchronize and rewrite the timestamps in an MCAP log using GPS-accurate time, cross-referenced from an ArduPilot dataflash log (`.BIN`) and a ground-control-station telemetry log (`.tlog`).
 
-## The problem
+## The Problem
+Common logs from an Ardupilot setup:
+*   **`.BIN` (Autopilot):** Runs on its own internal clock (`TimeUS`), but records precise GPS fixes.
+*   **`.tlog` (Telemetry):** Stamped by the ground control station's local unix clock.
+*   **`.mcap` (GCS additional Application):** Stamped by the companion computer's local unix clock, which frequently drifts or lacks NTP sync.
 
-A typical setup for logging a robot/drone flight ends up with three logs that each run on their own clock:
+This tool chains all three logs together, calculates and subtracts telemetry transmission latency, and updates the `.mcap` file's **`publish_time`** with trusted, GPS-derived unix time.
 
-| Log | Source | Clock |
-|---|---|---|
-| `.BIN` | Autopilot (ArduPilot dataflash) | Free-running `TimeUS`, but also carries GPS fixes |
-| `.tlog` | Ground control station | Its own local system unix clock |
-| `.mcap` | Companion computer | Its own local system unix clock |
-
-None of these clocks agree with each other, and system clocks can drift or simply be wrong if the machine isn't NTP-synced. The one clock you *can* trust is GPS time, which only shows up in the autopilot log. This tool chains all three logs together so the messages in your `.mcap` file end up stamped with GPS-derived unix time instead of whatever the recording computer's clock happened to say.
-Saves the synchronized time in the **publish_time** of the .mcap log.
-
-## How it works
+## How It Works
 
 ```mermaid
 flowchart LR
@@ -24,46 +19,49 @@ flowchart LR
     C[".tlog\nTIMESYNC messages"] -->|autopilot time ↔ GCS unix time| D
     E[".mcap\noriginal timestamps"] --> D
     D --> F[".mcap\nGPS-synced timestamps(publish_time)"]
+
 ```
 
-For every message in the `.mcap` file:
-
-1. Its recorded unix timestamp is matched against the `.tlog` **TIMESYNC** table to estimate the corresponding autopilot clock time.
-2. The telemetry link's round-trip time at that moment (from the `.BIN` **TSYN** messages) is halved and subtracted, correcting for one-way transmission delay.
-3. That corrected autopilot time is mapped through the `.BIN` **GPS** messages to get an accurate GPS-derived unix timestamp.
-4. The message is written to a new `.mcap` file with the corrected timestamp; everything else (topics, schemas, channels, data) is preserved as-is.
-
-All lookups interpolate linearly between the two nearest known sync points (extrapolating at the edges), and GPS fixes are only trusted when `HDOP ≤ 2.5` and satellite count `≥ 4`. Autopilot reboots detected mid-`.tlog` are handled by discarding the stale sync points that came before the restart.
-
+1. **Alignment:** Maps the `.mcap` timestamps to the autopilot's internal clock using `.tlog` `TIMESYNC` packets.
+2. **Latency Correction:** Subtracts half of the link's round-trip time (from `.BIN` `TSYN` messages) to correct for one-way latency.
+3. **GPS Mapping:** Translates the corrected autopilot time into absolute GPS unix time using high-quality `.BIN` `GPS` fixes (`HDOP ≤ 2.5` and `Satellites ≥ 4`).
+4. **Output:** Writes a new `*_synced.mcap` file preserving all original channels, data, and `log_time`, but with corrected `publish_time` stamps.
 
 ## Usage
 
 ```bash
-./sync.py <bin_path> <tlog_path> <mcap>
+./sync.py <bin_path> <tlog_path> [mcap_path] [flags]
+
 ```
 
-| Argument | Description |
-|---|---|
-| `bin_path` | Path to the autopilot's `.BIN` dataflash log |
-| `tlog_path` | Path to the ground control station's `.tlog` file |
-| `mcap` | Path to the `.mcap` log to correct (default: `logs/log.mcap`) |
+### Arguments & Options
 
-Example:
+| Argument / Flag | Type | Description |
+| --- | --- | --- |
+| `bin_path` | Positional | Path to the autopilot's `.BIN` dataflash log. |
+| `tlog_path` | Positional | Path to the ground control station's `.tlog` file. |
+| `mcap` | Positional | Path to the input `.mcap` log. *(Default: `logs/log.mcap`)* |
+| `--no-overlap-check` | Flag | Skips the safety validation that ensures the `.tlog` and `.mcap` files share an overlapping time window - the warning message. |
+
+### Example
 
 ```bash
-./sync.py logs/00000001.BIN logs/flight.tlog logs/log.mcap
+./sync.py logs/00000001.BIN logs/flight.tlog logs/flight_data.mcap
+
 ```
 
-This produces `logs/log_synced.mcap` alongside the original file where the synced time series is stored in the **publish_time**.
+This will output `logs/flight_data_synced.mcap`.
 
-## Building a standalone binary
+## Performance & Guardrails
 
-A one-file executable can be built with [Nuitka](https://nuitka.net/):
+* **Parallel Processing:** The script reads `.BIN` and `.tlog` files concurrently using a multi-process pool to accelerate parsing speed.
+* **Fast-Fail:** The program will immediately terminate and notify you if essential tracking packets (`TSYN`, `GPS`, or `TIMESYNC`) are entirely missing from your logs.
+* **Autopilot Restarts:** If the autopilot rebooted mid-flight, the script automatically detects the clock reset and discards stale sync points prior to the restart.
+
+## Building a Standalone Binary
+
+To compile the script into a portable, single-file executable using Nuitka:
 
 ```bash
 ./build.sh
 ```
-
-## Limitations
-
-- Exits early if `TSYN`, `GPS`, or `TIMESYNC` messages aren't present in the supplied logs.
