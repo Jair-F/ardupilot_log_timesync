@@ -4,12 +4,13 @@ import sys
 import time
 from multiprocessing import Pool
 
+import argcomplete
 import numpy
 import numpy.typing as npt
 from astropy.time import Time, TimeDelta
 from colorama import Fore, Style, init
 from mcap.reader import make_reader
-from mcap.writer import Writer
+from mcap.writer import CompressionType, Writer
 from pymavlink import mavutil
 from scipy.interpolate import interp1d
 
@@ -30,7 +31,7 @@ def gps_time_to_unix_time(gms: int, gwk: int) -> float:
 
 
 def read_bin_log_timesync_rtt(bin_log_file: str) -> npt.NDArray[numpy.float64]:
-    print(f'{Fore.CYAN}Started reading {bin_log_file} log TIMESYNC messages')
+    print(f'Started reading {bin_log_file} log TIMESYNC messages')
     ret: list[tuple[float, float]] = []
 
     log = mavutil.mavlink_connection(bin_log_file)
@@ -54,7 +55,7 @@ def read_bin_log_timesync_rtt(bin_log_file: str) -> npt.NDArray[numpy.float64]:
 
 
 def read_bin_log_gps(bin_log_file: str) -> npt.NDArray[numpy.float64]:
-    print(f'{Fore.CYAN}Started reading {bin_log_file} log GPS messages')
+    print(f'Started reading {bin_log_file} log GPS messages')
     ret: list[tuple[float, float]] = []
 
     log = mavutil.mavlink_connection(bin_log_file)
@@ -86,7 +87,7 @@ def read_bin_log_gps(bin_log_file: str) -> npt.NDArray[numpy.float64]:
 
 
 def read_tlog(tlog_file: str) -> npt.NDArray[numpy.float64]:
-    print(f'{Fore.CYAN}Started reading {tlog_file} TIMESYNC messages')
+    print(f'Started reading {tlog_file} TIMESYNC messages')
     log = mavutil.mavlink_connection(tlog_file)
     ret: list[tuple[float, float]] = []
 
@@ -224,14 +225,15 @@ def sync_mcap_timestamp(
 def sync_mcap(
     mcap_log_file: str,
     rtt_times: npt.NDArray[numpy.float64],
-    time_sync_times: npt.NDArray[numpy.float64],
+    timesync_times: npt.NDArray[numpy.float64],
     gps_sync_times: npt.NDArray[numpy.float64],
+    validate_times: bool,
 ) -> None:
     # pylint: disable=too-many-locals
     output_file = mcap_log_file.removesuffix('.mcap') + '_synced.mcap'
     with open(mcap_log_file, 'rb') as input_f, open(output_file, 'wb') as output_f:
         reader = make_reader(input_f)
-        writer = Writer(output_f)
+        writer = Writer(output_f, chunk_size=4 * 1024 * 1024, compression=CompressionType.ZSTD)
 
         header = reader.get_header()
         source_profile = header.profile if header else ''
@@ -242,7 +244,7 @@ def sync_mcap(
         schema_id_map = {}
         channel_id_map = {}
 
-        print(f'{Fore.BLUE}Pass 1: Cloning file metadata structures...')
+        print('Pass 1: Cloning file metadata structures...')
         for schema_id, schema_record in reader.get_summary().schemas.items():
             new_schema_id = writer.register_schema(
                 name=schema_record.name,
@@ -262,9 +264,16 @@ def sync_mcap(
             )
             channel_id_map[channel_id] = new_channel_id
 
-        print(f'{Fore.BLUE}Pass 2: Rewriting messages with updated timestamps...')
+        time_spans_overlapp = False
+        print('Pass 2: Rewriting messages with updated timestamps...')
         for _, channel, message in reader.iter_messages():
-            new_publish_time = sync_mcap_timestamp(message.publish_time, rtt_times, time_sync_times, gps_sync_times)
+            old_publish_time = message.publish_time
+            new_publish_time = sync_mcap_timestamp(old_publish_time, rtt_times, timesync_times, gps_sync_times)
+
+            if validate_times and not time_spans_overlapp:
+                time_spans_overlapp = check_if_time_spans_overlap(timesync_times, old_publish_time / 1e9)
+                if time_spans_overlapp:
+                    print(f'{Fore.GREEN}{Style.BRIGHT}Found overlapping time section in tlog and mcap time series')
 
             target_channel_id = channel_id_map[channel.id]
 
@@ -279,8 +288,25 @@ def sync_mcap(
         writer.finish()
         print(f'{Fore.GREEN}{Style.BRIGHT}File writing finished successfully: {output_file}')
 
+        if not time_spans_overlapp and validate_times:
+            print(
+                f"{Fore.RED}{Style.BRIGHT}Time Sync probably didn't work as expected -"
+                + ".tlog times and mcap don't share a common time section",
+            )
 
-def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str) -> None:
+
+def check_if_time_spans_overlap(timesync_times: npt.NDArray[numpy.float64], old_publish_time: float) -> bool:
+    length = len(timesync_times)
+    for i, _ in enumerate(timesync_times):
+        if i < length - 2:
+            this_unix_time = timesync_times[i][1]
+            next_unix_time = timesync_times[i + 1][1]
+            if this_unix_time < old_publish_time < next_unix_time:
+                return True
+    return False
+
+
+def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str, validate_times: bool = True) -> None:
     rtt_times: npt.NDArray[numpy.float64]
     timesync_times: npt.NDArray[numpy.float64]
 
@@ -324,7 +350,7 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str) -> None:
         sys.exit(1)
 
     rtt_times = map_rtt_timeus_to_unixtime(rtt_times, timesync_times)
-    sync_mcap(mcap_path, rtt_times, timesync_times, gps_timesync_times)
+    sync_mcap(mcap_path, rtt_times, timesync_times, gps_timesync_times, validate_times)
 
 
 def main() -> None:
@@ -339,12 +365,19 @@ def main() -> None:
         default='logs/log.mcap',
         help='Path to the .mcap file (default: logs/log.mcap)',
     )
+    parser.add_argument(
+        '--no-overlap-check',
+        action='store_true',
+        help='Dont check if the time series over of the mcap log and the tlog overlap',
+    )
 
+    argcomplete.autocomplete(parser)
     args = parser.parse_args()
     sync_parallel(
         bin_path=args.bin_path,
         tlog_path=args.tlog_path,
         mcap_path=args.mcap,
+        validate_times=not args.no_overlap_check,
     )
 
 

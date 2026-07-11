@@ -15,6 +15,7 @@ dependencies = [
     "scipy",
     "astropy",
     "colorama",
+    "argcomplete",
 ]
 
 [project.optional-dependencies]
