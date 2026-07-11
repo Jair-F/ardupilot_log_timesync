@@ -306,7 +306,9 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str, validate_times:
     with Pool(processes=3) as pool:
         try:
             rtt_handle = pool.apply_async(read_bin_log_timesync_rtt, args=(bin_path,))
+            time.sleep(0.02)
             gps_handle = pool.apply_async(read_bin_log_gps, args=(bin_path,))
+            time.sleep(0.02)
             tlog_handle = pool.apply_async(read_tlog, args=(tlog_path,))
 
             handles = [rtt_handle, gps_handle, tlog_handle]
