@@ -16,6 +16,7 @@ from scipy.interpolate import interp1d
 
 SECONDS_PER_WEEK = 7 * 24 * 60 * 60
 MIN_REQUIRED_SAMPLES = 2
+MAX_RTT_SECONDS = 5.0
 
 
 class MissingDataError(Exception):
@@ -233,6 +234,11 @@ def sync_mcap_timestamp(
     rtt_index = find_closest_index(unixtime_pt_s, 0, rtt_times)
     rtt_s = rtt_times[rtt_index][1]
 
+    # if rtt crosses max_rtt_seconds take the rtt mean value
+    if rtt_s >= MAX_RTT_SECONDS:
+        rtt_col = rtt_times[:, 1]
+        rtt_s = rtt_col[rtt_col < MAX_RTT_SECONDS].mean()
+
     autopilot_time_s = map_unix_time_to_autopilot_timeus_s(unixtime_pt_s, gcs_time_sync_times)
     corrected_autopilot_time_s = autopilot_time_s - (rtt_s / 2.0)
 
@@ -243,11 +249,10 @@ def sync_mcap_timestamp(
 
     new_time_ns = int(gps_unix_time_s * 1e9)
     if not 0 <= new_time_ns <= 2**64 - 1:
-        pass
-    #     raise ValueError(
-    #         f'Computed out-of-range publish_time {new_time_ns} for input {unixtime_pt_ns} - '
-    #         'check that the .mcap and .tlog time ranges overlap (or are close enough to extrapolate safely)'
-    #     )
+        raise ValueError(
+            f'Computed out-of-range publish_time {new_time_ns} for input {unixtime_pt_ns} - '
+            'check that the .mcap and .tlog time ranges overlap (or are close enough to extrapolate safely)',
+        )
     return new_time_ns
 
 
