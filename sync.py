@@ -76,6 +76,9 @@ def read_bin_log_gps(bin_log_file: str) -> npt.NDArray[numpy.float64]:
         if msg.HDop > 2.5 or msg.NSats < 4:
             continue
 
+        if msg.GMS == 0 or msg.GWk == 0:
+            continue
+
         time_us = msg.TimeUS / 1e6
         gps_synced_unixtime = gps_time_to_unix_time(msg.GMS, msg.GWk)
         samples.append((time_us, gps_synced_unixtime))
@@ -193,7 +196,16 @@ def map_unix_time_to_autopilot_timeus_s(
     unix_time_point: float,
     gcs_time_sync_times: npt.NDArray[numpy.float64],
 ) -> float:
-    sync_index = find_closest_index(unix_time_point, 0, gcs_time_sync_times, compare_index=1)
+    if not hasattr(map_unix_time_to_autopilot_timeus_s, 'index'):
+        map_unix_time_to_autopilot_timeus_s.index = 0
+
+    sync_index = find_closest_index(
+        unix_time_point,
+        map_unix_time_to_autopilot_timeus_s.index,
+        gcs_time_sync_times,
+        compare_index=1,
+    )
+    map_unix_time_to_autopilot_timeus_s.index = sync_index
 
     unix_to_autopilot = interp1d(
         (gcs_time_sync_times[sync_index][1], gcs_time_sync_times[sync_index + 1][1]),
@@ -210,7 +222,15 @@ def map_autopilot_timeus_to_gps_unixtime_s(
     autopilot_timeus_s: float,
     gps_sync_times: npt.NDArray[numpy.float64],
 ) -> float:
-    gps_sync_index = find_closest_index(autopilot_timeus_s, 0, gps_sync_times)
+    if not hasattr(map_autopilot_timeus_to_gps_unixtime_s, 'index'):
+        map_autopilot_timeus_to_gps_unixtime_s.index = 0
+    gps_sync_index = find_closest_index(
+        autopilot_timeus_s,
+        map_autopilot_timeus_to_gps_unixtime_s.index,
+        gps_sync_times,
+    )
+    map_autopilot_timeus_to_gps_unixtime_s.index = gps_sync_index
+
     unix_to_autopilot = interp1d(
         (gps_sync_times[gps_sync_index][0], gps_sync_times[gps_sync_index + 1][0]),
         (gps_sync_times[gps_sync_index][1], gps_sync_times[gps_sync_index + 1][1]),
@@ -231,7 +251,10 @@ def sync_mcap_timestamp(
     # pylint: disable=too-many-locals
     unixtime_pt_s = float(unixtime_pt_ns) / 1e9
 
-    rtt_index = find_closest_index(unixtime_pt_s, 0, rtt_times)
+    if not hasattr(sync_mcap_timestamp, 'index'):
+        sync_mcap_timestamp.index = 0
+    rtt_index = find_closest_index(unixtime_pt_s, sync_mcap_timestamp.index, rtt_times)
+    sync_mcap_timestamp.index = rtt_index
     rtt_s = rtt_times[rtt_index][1]
 
     # if rtt crosses max_rtt_seconds take the rtt mean value
