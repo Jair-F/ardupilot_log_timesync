@@ -106,7 +106,8 @@ def read_tlog(tlog_file: str) -> npt.NDArray[numpy.float64]:
         if msg.tc1 == 0 or msg.ts1 == 0:
             continue
 
-        unix_time = msg.tc1 / 1e9
+        utc_time = msg.tc1 / 1e9
+        unix_time = Time(utc_time, format='unix', scale='utc').unix
         time_us = msg.ts1 / 1e9
 
         # removing pixhawk restarts if there are
