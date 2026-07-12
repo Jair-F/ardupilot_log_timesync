@@ -1,8 +1,26 @@
 #!/bin/python3
+"""
+Synchronizes an .mcap log's message timestamps onto GPS-derived unix time.
+
+Three inputs are correlated:
+  - a flight controller .BIN log, which provides:
+      * TSYN messages -> ground-station <-> autopilot round-trip time (RTT)
+      * GPS messages   -> autopilot time_us <-> GPS-synced unix time
+  - a ground-station .tlog, which provides:
+      * TIMESYNC messages -> autopilot time_us <-> ground-station unix time
+  - the .mcap file to be re-timestamped, whose messages carry ground-station
+    unix publish times.
+
+For each mcap message, its ground-station unix time is mapped to autopilot
+time, corrected for half the round-trip time, and then mapped to GPS-synced
+unix time - producing a new, GPS-accurate `publish_time` for that message.
+"""
+
 import argparse
 import sys
 import time
-from multiprocessing.pool import Pool
+from collections.abc import Iterator
+from multiprocessing.pool import ApplyResult, Pool
 
 import argcomplete
 import numpy
@@ -23,7 +41,13 @@ class MissingDataError(Exception):
     pass
 
 
+# ============================================================================
+# Time conversion helpers
+# ============================================================================
+
+
 def gps_time_to_unix_time(gms: int, gwk: int) -> float:
+    """Convert a GPS week number + milliseconds-of-week into unix time."""
     gps_week_start_seconds = gwk * SECONDS_PER_WEEK
 
     week_start = Time(gps_week_start_seconds, format='gps')
@@ -34,26 +58,33 @@ def gps_time_to_unix_time(gms: int, gwk: int) -> float:
 
 
 def _require_min_samples(samples: list[tuple[float, float]], log_file: str, message_type: str) -> None:
+    """Raise MissingDataError if too few samples were collected to interpolate from."""
     if len(samples) < MIN_REQUIRED_SAMPLES:
         print(f"{Fore.RED}Didn't find any {message_type} in {log_file} - exiting", flush=True)
         raise MissingDataError(f'Missing {message_type} in {log_file}')
 
 
-def read_bin_log_timesync_rtt(bin_log_file: str) -> npt.NDArray[numpy.float64]:
-    print(f'Started reading {bin_log_file} log TIMESYNC messages')
-    samples: list[tuple[float, float]] = []
+# ============================================================================
+# Log readers (.BIN / .tlog)
+# ============================================================================
 
-    log = mavutil.mavlink_connection(bin_log_file)
+
+def _iter_mavlink_messages(log_file: str, message_type: str) -> Iterator[mavutil.mavlink.MAVLink_message]:
+    """Yield each message of `message_type` from a mavlink log, in file order."""
+    log = mavutil.mavlink_connection(log_file)
     while True:
         msg = log.recv_match()
         if msg is None:
-            break
+            return
+        if msg.get_type() == message_type:
+            yield msg
 
-        if msg.get_type() == 'TSYN':
-            time_us = msg.TimeUS / 1e6
-            rtt = msg.RTT / 1e6
-            samples.append((time_us, rtt))
 
+def read_bin_log_timesync_rtt(bin_log_file: str) -> npt.NDArray[numpy.float64]:
+    """Read TSYN messages from a .BIN log as (autopilot_time_s, round_trip_time_s) pairs."""
+    print(f'Started reading {bin_log_file} log TIMESYNC messages')
+
+    samples = [(msg.TimeUS / 1e6, msg.RTT / 1e6) for msg in _iter_mavlink_messages(bin_log_file, 'TSYN')]
     _require_min_samples(samples, bin_log_file, 'TSYN')
 
     print(f'{Fore.GREEN}Finished reading {bin_log_file} log TIMESYNC messages')
@@ -61,21 +92,17 @@ def read_bin_log_timesync_rtt(bin_log_file: str) -> npt.NDArray[numpy.float64]:
 
 
 def read_bin_log_gps(bin_log_file: str) -> npt.NDArray[numpy.float64]:
+    """Read GPS messages from a .BIN log as (autopilot_time_s, gps_unix_time_s) pairs.
+
+    Rows with a poor fix (HDop > 2.5, fewer than 4 satellites) or without a valid
+    GPS week/time-of-week are skipped.
+    """
     print(f'Started reading {bin_log_file} log GPS messages')
+
     samples: list[tuple[float, float]] = []
-
-    log = mavutil.mavlink_connection(bin_log_file)
-    while True:
-        msg = log.recv_match()
-        if msg is None:
-            break
-
-        if msg.get_type() != 'GPS':
-            continue
-
+    for msg in _iter_mavlink_messages(bin_log_file, 'GPS'):
         if msg.HDop > 2.5 or msg.NSats < 4:
             continue
-
         if msg.GMS == 0 or msg.GWk == 0:
             continue
 
@@ -90,19 +117,17 @@ def read_bin_log_gps(bin_log_file: str) -> npt.NDArray[numpy.float64]:
 
 
 def read_tlog(tlog_file: str) -> npt.NDArray[numpy.float64]:
+    """Read TIMESYNC messages from a .tlog as (autopilot_time_s, gcs_unix_time_s) pairs.
+
+    If a Pixhawk restart is detected (autopilot time going backwards), samples
+    collected before the restart are discarded, since they belong to a
+    different autopilot-time epoch.
+    """
     print(f'Started reading {tlog_file} TIMESYNC messages')
-    log = mavutil.mavlink_connection(tlog_file)
+
     samples: list[tuple[float, float]] = []
-
     last_time_us = 0
-    while True:
-        msg = log.recv_match()
-        if msg is None:
-            break
-
-        if msg.get_type() != 'TIMESYNC':
-            continue
-
+    for msg in _iter_mavlink_messages(tlog_file, 'TIMESYNC'):
         if msg.tc1 == 0 or msg.ts1 == 0:
             continue
 
@@ -110,7 +135,6 @@ def read_tlog(tlog_file: str) -> npt.NDArray[numpy.float64]:
         unix_time = Time(utc_time, format='unix', scale='utc').unix
         time_us = msg.ts1 / 1e9
 
-        # removing pixhawk restarts if there are
         if last_time_us > time_us:
             print(f'{Fore.YELLOW}Pixhawk restart at(removing) TimeUS: {last_time_us} - UnixTime: {unix_time}')
             samples = []
@@ -125,6 +149,11 @@ def read_tlog(tlog_file: str) -> npt.NDArray[numpy.float64]:
 
 
 def read_mcap_time_bounds(mcap_file: str) -> tuple[float, float]:
+    """Return the (start, end) unix timestamps spanned by an .mcap file's messages.
+
+    Uses the file's summary statistics when available; falls back to scanning
+    every message otherwise.
+    """
     print(f'Started reading {mcap_file} time bounds')
 
     with open(mcap_file, 'rb') as f:
@@ -157,12 +186,31 @@ def read_mcap_time_bounds(mcap_file: str) -> tuple[float, float]:
     return first_time_ns / 1e9, last_time_ns / 1e9
 
 
+# ============================================================================
+# Sequential nearest-index / interpolation lookups
+#
+# Every sync array below is sorted ascending in time, and every value we look
+# up (rtt samples in mcap-message order, mcap messages in file order, etc.)
+# arrives in non-decreasing order too. That means the matching bracket in the
+# sync array only ever moves forward, so a lookup never needs to restart its
+# search from the beginning - it just resumes from wherever the last lookup
+# left off. `SequentialLookup` captures that cursor so callers don't have to
+# thread the index through by hand.
+# ============================================================================
+
+
 def find_closest_index(
     value: float | int,
     start_index: int,
     sync_array: npt.NDArray[numpy.float64],
     compare_index: int = 0,
 ) -> int:
+    """
+    Starting at `start_index`, advance forward through `sync_array` (sorted
+    ascending on column `compare_index`) while the *next* row is still <=
+    `value`. Returns the index `i` of the bracket [i, i+1] that `value` falls
+    into (or the last available bracket, if `value` is past the array's end).
+    """
     max_idx = len(sync_array) - 2
 
     while start_index < max_idx and value > sync_array[start_index + 1][compare_index]:
@@ -171,105 +219,80 @@ def find_closest_index(
     return start_index
 
 
+class SequentialLookup:
+    """
+    A sorted two-column array plus a forward-only search cursor, supporting
+    repeated nearest-index and linear-interpolation lookups.
+
+    `compare_index` selects which column is the "key" being searched on; the
+    other column is the value that gets interpolated.
+    """
+
+    def __init__(self, sync_array: npt.NDArray[numpy.float64], compare_index: int = 0) -> None:
+        self.array = sync_array
+        self._compare_index = compare_index
+        self._value_index = 1 - compare_index
+        self._cursor = 0
+
+    def index_at(self, value: float) -> int:
+        """Advance the cursor to the bracket containing `value` and return its index."""
+        self._cursor = find_closest_index(value, self._cursor, self.array, self._compare_index)
+        return self._cursor
+
+    def interpolate(self, value: float) -> float:
+        """Linearly interpolate (or extrapolate, past the array's ends) the value column at `value`."""
+        idx = self.index_at(value)
+        x = (self.array[idx][self._compare_index], self.array[idx + 1][self._compare_index])
+        y = (self.array[idx][self._value_index], self.array[idx + 1][self._value_index])
+
+        interp_func = interp1d(x, y, kind='linear', bounds_error=False, fill_value='extrapolate')
+        return float(interp_func(value))
+
+
 def map_rtt_timeus_to_unixtime(
     rtt_times: npt.NDArray[numpy.float64],
     time_sync_times: npt.NDArray[numpy.float64],
 ) -> npt.NDArray[numpy.float64]:
-    search_index = 0
+    """Rewrite `rtt_times`' time column from autopilot time_us into ground-station unix time, in place."""
+    lookup = SequentialLookup(time_sync_times, compare_index=0)
 
     for row_index, (time_us, _rtt) in enumerate(rtt_times):
-        search_index = find_closest_index(time_us, search_index, time_sync_times)
-
-        interp_func = interp1d(
-            (time_sync_times[search_index][0], time_sync_times[search_index + 1][0]),
-            (time_sync_times[search_index][1], time_sync_times[search_index + 1][1]),
-            kind='linear',
-            bounds_error=False,
-            fill_value='extrapolate',
-        )
-
-        rtt_times[row_index, 0] = float(interp_func(time_us))
+        rtt_times[row_index, 0] = lookup.interpolate(time_us)
 
     return rtt_times
 
 
-def map_unix_time_to_autopilot_timeus_s(
-    unix_time_point: float,
-    gcs_time_sync_times: npt.NDArray[numpy.float64],
-) -> float:
-    if not hasattr(map_unix_time_to_autopilot_timeus_s, 'index'):
-        map_unix_time_to_autopilot_timeus_s.index = 0
-
-    sync_index = find_closest_index(
-        unix_time_point,
-        map_unix_time_to_autopilot_timeus_s.index,
-        gcs_time_sync_times,
-        compare_index=1,
-    )
-    map_unix_time_to_autopilot_timeus_s.index = sync_index
-
-    unix_to_autopilot = interp1d(
-        (gcs_time_sync_times[sync_index][1], gcs_time_sync_times[sync_index + 1][1]),
-        (gcs_time_sync_times[sync_index][0], gcs_time_sync_times[sync_index + 1][0]),
-        kind='linear',
-        bounds_error=False,
-        fill_value='extrapolate',
-    )
-
-    return float(unix_to_autopilot(unix_time_point))
-
-
-def map_autopilot_timeus_to_gps_unixtime_s(
-    autopilot_timeus_s: float,
-    gps_sync_times: npt.NDArray[numpy.float64],
-) -> float:
-    if not hasattr(map_autopilot_timeus_to_gps_unixtime_s, 'index'):
-        map_autopilot_timeus_to_gps_unixtime_s.index = 0
-    gps_sync_index = find_closest_index(
-        autopilot_timeus_s,
-        map_autopilot_timeus_to_gps_unixtime_s.index,
-        gps_sync_times,
-    )
-    map_autopilot_timeus_to_gps_unixtime_s.index = gps_sync_index
-
-    unix_to_autopilot = interp1d(
-        (gps_sync_times[gps_sync_index][0], gps_sync_times[gps_sync_index + 1][0]),
-        (gps_sync_times[gps_sync_index][1], gps_sync_times[gps_sync_index + 1][1]),
-        kind='linear',
-        bounds_error=False,
-        fill_value='extrapolate',
-    )
-
-    return float(unix_to_autopilot(autopilot_timeus_s))
+# ============================================================================
+# Per-message timestamp synchronization
+# ============================================================================
 
 
 def sync_mcap_timestamp(
     unixtime_pt_ns: int,
-    rtt_times: npt.NDArray[numpy.float64],
-    gcs_time_sync_times: npt.NDArray[numpy.float64],
-    gps_sync_times: npt.NDArray[numpy.float64],
+    rtt_lookup: SequentialLookup,
+    unix_to_autopilot_lookup: SequentialLookup,
+    autopilot_to_gps_lookup: SequentialLookup,
 ) -> int:
-    # pylint: disable=too-many-locals
+    """
+    Convert one mcap message's ground-station unix publish_time (ns) into a
+    GPS-derived unix publish_time (ns):
+
+        gcs unix time -> autopilot time_us -> (- RTT / 2) -> GPS unix time
+    """
     unixtime_pt_s = float(unixtime_pt_ns) / 1e9
 
-    if not hasattr(sync_mcap_timestamp, 'index'):
-        sync_mcap_timestamp.index = 0
-    rtt_index = find_closest_index(unixtime_pt_s, sync_mcap_timestamp.index, rtt_times)
-    sync_mcap_timestamp.index = rtt_index
-    rtt_s = rtt_times[rtt_index][1]
+    rtt_index = rtt_lookup.index_at(unixtime_pt_s)
+    rtt_s = rtt_lookup.array[rtt_index][1]
 
     # if rtt crosses max_rtt_seconds take the rtt mean value
     if rtt_s >= MAX_RTT_SECONDS:
-        rtt_col = rtt_times[:, 1]
+        rtt_col = rtt_lookup.array[:, 1]
         rtt_s = rtt_col[rtt_col < MAX_RTT_SECONDS].mean()
 
-    autopilot_time_s = map_unix_time_to_autopilot_timeus_s(unixtime_pt_s, gcs_time_sync_times)
+    autopilot_time_s = unix_to_autopilot_lookup.interpolate(unixtime_pt_s)
     corrected_autopilot_time_s = autopilot_time_s - (rtt_s / 2.0)
 
-    gps_unix_time_s = map_autopilot_timeus_to_gps_unixtime_s(
-        corrected_autopilot_time_s,
-        gps_sync_times,
-    )
+    gps_unix_time_s = autopilot_to_gps_lookup.interpolate(corrected_autopilot_time_s)
 
     new_time_ns = int(gps_unix_time_s * 1e9)
     if not 0 <= new_time_ns <= 2**64 - 1:
@@ -280,6 +303,36 @@ def sync_mcap_timestamp(
     return new_time_ns
 
 
+def _clone_schemas_and_channels(reader, writer) -> tuple[dict[int, int], dict[int, int]]:
+    """
+    Copy every schema and channel definition from `reader` into `writer`.
+
+    Returns (schema_id_map, channel_id_map), mapping each original id to the
+    id it was assigned in the new file.
+    """
+    summary = reader.get_summary()
+
+    schema_id_map = {}
+    for schema_id, schema_record in summary.schemas.items():
+        schema_id_map[schema_id] = writer.register_schema(
+            name=schema_record.name,
+            encoding=schema_record.encoding,
+            data=schema_record.data,
+        )
+
+    channel_id_map = {}
+    for channel_id, channel_record in summary.channels.items():
+        new_schema_id = schema_id_map.get(channel_record.schema_id, 0)
+        channel_id_map[channel_id] = writer.register_channel(
+            topic=channel_record.topic,
+            message_encoding=channel_record.message_encoding,
+            schema_id=new_schema_id,
+            metadata=channel_record.metadata,
+        )
+
+    return schema_id_map, channel_id_map
+
+
 def sync_mcap(
     mcap_log_file: str,
     rtt_times: npt.NDArray[numpy.float64],
@@ -287,7 +340,12 @@ def sync_mcap(
     gps_sync_times: npt.NDArray[numpy.float64],
 ) -> None:
     # pylint: disable=too-many-locals
+    """Rewrite `mcap_log_file` to `<name>_synced.mcap` with GPS-synced publish times."""
     output_file = mcap_log_file.removesuffix('.mcap') + '_synced.mcap'
+
+    rtt_lookup = SequentialLookup(rtt_times, compare_index=0)
+    unix_to_autopilot_lookup = SequentialLookup(timesync_times, compare_index=1)
+    autopilot_to_gps_lookup = SequentialLookup(gps_sync_times, compare_index=0)
 
     with open(mcap_log_file, 'rb') as input_f, open(output_file, 'wb') as output_f:
         reader = make_reader(input_f)
@@ -299,33 +357,17 @@ def sync_mcap(
         print(f"\n{Fore.MAGENTA}Detected Source Profile: '{source_profile}' | Library: '{source_library}'")
         writer.start(profile=source_profile, library=source_library)
 
-        schema_id_map = {}
-        channel_id_map = {}
-
         print('Pass 1: Cloning file metadata structures...')
-        for schema_id, schema_record in reader.get_summary().schemas.items():
-            new_schema_id = writer.register_schema(
-                name=schema_record.name,
-                encoding=schema_record.encoding,
-                data=schema_record.data,
-            )
-            schema_id_map[schema_id] = new_schema_id
-
-        for channel_id, channel_record in reader.get_summary().channels.items():
-            new_schema_id = schema_id_map.get(channel_record.schema_id, 0)
-
-            new_channel_id = writer.register_channel(
-                topic=channel_record.topic,
-                message_encoding=channel_record.message_encoding,
-                schema_id=new_schema_id,
-                metadata=channel_record.metadata,
-            )
-            channel_id_map[channel_id] = new_channel_id
+        _, channel_id_map = _clone_schemas_and_channels(reader, writer)
 
         print('Pass 2: Rewriting messages with updated timestamps...')
         for _, channel, message in reader.iter_messages():
-            new_publish_time = sync_mcap_timestamp(message.publish_time, rtt_times, timesync_times, gps_sync_times)
-
+            new_publish_time = sync_mcap_timestamp(
+                message.publish_time,
+                rtt_lookup,
+                unix_to_autopilot_lookup,
+                autopilot_to_gps_lookup,
+            )
             target_channel_id = channel_id_map[channel.id]
 
             writer.add_message(
@@ -340,11 +382,17 @@ def sync_mcap(
         print(f'{Fore.GREEN}{Style.BRIGHT}File writing finished successfully: {output_file}')
 
 
+# ============================================================================
+# Overlap validation
+# ============================================================================
+
+
 def check_if_time_spans_overlap(
     timesync_times: npt.NDArray[numpy.float64],
     mcap_start_s: float,
     mcap_end_s: float,
 ) -> bool:
+    """Return whether the tlog's time span and the mcap's time span overlap at all."""
     if len(timesync_times) < 2:
         return False
 
@@ -354,15 +402,58 @@ def check_if_time_spans_overlap(
     return bool(mcap_start_s <= tlog_end_s and mcap_end_s >= tlog_start_s)
 
 
+def validate_times_overlap(
+    timesync_times: npt.NDArray[numpy.float64],
+    mcap_start_s: float,
+    mcap_end_s: float,
+) -> None:
+    """Print a warning if the tlog and mcap time spans don't share a common time section."""
+    if check_if_time_spans_overlap(timesync_times, mcap_start_s, mcap_end_s):
+        print(f'{Fore.GREEN}{Style.BRIGHT}Found overlapping time section in tlog and mcap time series')
+        return
+
+    tlog_start_s, tlog_end_s = timesync_times[0][1], timesync_times[-1][1]
+    print(
+        f"{Fore.RED}{Style.BRIGHT}[WARNING] Time Sync probably didn't work as expected - "
+        f'.tlog ({tlog_start_s:.1f} - {tlog_end_s:.1f}) and mcap ({mcap_start_s:.1f} - {mcap_end_s:.1f}) '
+        "don't share a common time section",
+    )
+
+
+# ============================================================================
+# Parallel orchestration
+# ============================================================================
+
+
 def _fail_and_terminate(pool: Pool, message: str, exit_code: int) -> None:
+    """Print `message`, forcibly stop all pool workers, and exit the process."""
     print(message, flush=True)
     pool.terminate()
     pool.join()
     sys.exit(exit_code)
 
 
+def _wait_for_handles(pool: Pool, handles: list[ApplyResult]) -> None:
+    """
+    Poll `handles` until every one has completed.
+
+    Fails fast (terminating the pool) if any handle completes with a `None`
+    result, which signals missing tracking packets.
+    """
+    while not all(h.ready() for h in handles):
+        for h in handles:
+            if h.ready() and h.get() is None:
+                _fail_and_terminate(
+                    pool,
+                    f'\n{Fore.RED}{Style.BRIGHT}[CRITICAL] Fast-failing due to missing '
+                    'tracking packets. Terminating remaining workers...',
+                    -1,
+                )
+        time.sleep(0.1)
+
+
 def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str, validate_times: bool = True) -> None:
-    # pylint: disable=too-many-locals
+    """Read the .BIN/.tlog inputs concurrently, then produce the synced .mcap output."""
     with Pool(processes=3) as pool:
         try:
             rtt_handle = pool.apply_async(read_bin_log_timesync_rtt, args=(bin_path,))
@@ -371,24 +462,13 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str, validate_times:
             time.sleep(0.02)
             tlog_handle = pool.apply_async(read_tlog, args=(tlog_path,))
 
-            handles = [rtt_handle, gps_handle, tlog_handle]
-
-            while not all(h.ready() for h in handles):
-                for h in handles:
-                    if h.ready() and h.get() is None:
-                        _fail_and_terminate(
-                            pool,
-                            f'\n{Fore.RED}{Style.BRIGHT}[CRITICAL] Fast-failing due to missing '
-                            'tracking packets. Terminating remaining workers...',
-                            -1,
-                        )
-                time.sleep(0.1)
+            _wait_for_handles(pool, [rtt_handle, gps_handle, tlog_handle])
 
             rtt_times = rtt_handle.get()
             timesync_times = tlog_handle.get()
             gps_timesync_times = gps_handle.get()
 
-        except (MissingDataError, Exception) as e:  # pylint: disable=broad-exception-caught
+        except Exception as e:  # pylint: disable=broad-exception-caught
             _fail_and_terminate(
                 pool,
                 f'\n{Fore.RED}{Style.BRIGHT}[CRITICAL] Error or missing '
@@ -407,21 +487,9 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str, validate_times:
     sync_mcap(mcap_path, rtt_times, timesync_times, gps_timesync_times)
 
 
-def validate_times_overlap(
-    timesync_times: npt.NDArray[numpy.float64],
-    mcap_start_s: float,
-    mcap_end_s: float,
-) -> None:
-    if check_if_time_spans_overlap(timesync_times, mcap_start_s, mcap_end_s):
-        print(f'{Fore.GREEN}{Style.BRIGHT}Found overlapping time section in tlog and mcap time series')
-        return
-
-    tlog_start_s, tlog_end_s = timesync_times[0][1], timesync_times[-1][1]
-    print(
-        f"{Fore.RED}{Style.BRIGHT}[WARNING] Time Sync probably didn't work as expected - "
-        f'.tlog ({tlog_start_s:.1f} - {tlog_end_s:.1f}) and mcap ({mcap_start_s:.1f} - {mcap_end_s:.1f}) '
-        "don't share a common time section",
-    )
+# ============================================================================
+# CLI entry point
+# ============================================================================
 
 
 def main() -> None:
