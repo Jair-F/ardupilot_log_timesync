@@ -36,6 +36,12 @@ SECONDS_PER_WEEK = 7 * 24 * 60 * 60
 MIN_REQUIRED_SAMPLES = 2
 MAX_RTT_SECONDS = 5.0
 
+# Dynamically calculate the system's current timezone offset from UTC in hours.
+is_dst = time.localtime().tm_isdst > 0
+local_offset_seconds = -time.altzone if is_dst else -time.timezone
+DEFAULT_TZ_OFFSET_HOURS = local_offset_seconds / 3600.0
+CURRENT_TZ_NAME = time.tzname[1 if is_dst else 0]
+
 
 class MissingDataError(Exception):
     pass
@@ -46,7 +52,7 @@ class MissingDataError(Exception):
 # ============================================================================
 
 
-def gps_time_to_unix_time(gms: int, gwk: int) -> float:
+def gps_time_to_unix_time(gms: int, gwk: int, offset_hours: float = 0.0) -> float:
     """Convert a GPS week number + milliseconds-of-week into unix time."""
     gps_week_start_seconds = gwk * SECONDS_PER_WEEK
 
@@ -54,7 +60,8 @@ def gps_time_to_unix_time(gms: int, gwk: int) -> float:
     offset = TimeDelta(gms / 1000.0, format='sec')
     absolute_time = week_start + offset
 
-    return float(absolute_time.unix)
+    utc_unix = float(absolute_time.unix)
+    return utc_unix + (offset_hours * 3600.0)
 
 
 def _require_min_samples(samples: list[tuple[float, float]], log_file: str, message_type: str) -> None:
@@ -91,7 +98,7 @@ def read_bin_log_timesync_rtt(bin_log_file: str) -> npt.NDArray[numpy.float64]:
     return numpy.array(samples)
 
 
-def read_bin_log_gps(bin_log_file: str) -> npt.NDArray[numpy.float64]:
+def read_bin_log_gps(bin_log_file: str, offset_hours: float = 0.0) -> npt.NDArray[numpy.float64]:
     """Read GPS messages from a .BIN log as (autopilot_time_s, gps_unix_time_s) pairs.
 
     Rows with a poor fix (HDop > 2.5, fewer than 4 satellites) or without a valid
@@ -107,7 +114,7 @@ def read_bin_log_gps(bin_log_file: str) -> npt.NDArray[numpy.float64]:
             continue
 
         time_us = msg.TimeUS / 1e6
-        gps_synced_unixtime = gps_time_to_unix_time(msg.GMS, msg.GWk)
+        gps_synced_unixtime = gps_time_to_unix_time(msg.GMS, msg.GWk, offset_hours)
         samples.append((time_us, gps_synced_unixtime))
 
     _require_min_samples(samples, bin_log_file, 'GPS time')
@@ -452,13 +459,13 @@ def _wait_for_handles(pool: Pool, handles: list[ApplyResult]) -> None:
         time.sleep(0.1)
 
 
-def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str, validate_times: bool = True) -> None:
+def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str, validate_times: bool = True, offset_hours: float = 0.0) -> None:
     """Read the .BIN/.tlog inputs concurrently, then produce the synced .mcap output."""
     with Pool(processes=3) as pool:
         try:
             rtt_handle = pool.apply_async(read_bin_log_timesync_rtt, args=(bin_path,))
             time.sleep(0.02)
-            gps_handle = pool.apply_async(read_bin_log_gps, args=(bin_path,))
+            gps_handle = pool.apply_async(read_bin_log_gps, args=(bin_path, offset_hours))
             time.sleep(0.02)
             tlog_handle = pool.apply_async(read_tlog, args=(tlog_path,))
 
@@ -493,7 +500,16 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str, validate_times:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Multiprocess log file synchronizer.')
+    # Print the timezone context before parsing arguments so the user always sees it
+    print(f"{Fore.CYAN}System Current Timezone: {CURRENT_TZ_NAME} | Default Offset: {DEFAULT_TZ_OFFSET_HOURS} hours{Style.RESET_ALL}\n")
+
+    parser = argparse.ArgumentParser(
+        description=(
+            'Multiprocess log file synchronizer.\n'
+            f'System Current Timezone: {CURRENT_TZ_NAME} | Default Offset: {DEFAULT_TZ_OFFSET_HOURS} hours'
+        ),
+        formatter_class=argparse.RawTextHelpFormatter
+    )
 
     parser.add_argument('bin_path', type=str, help='Path to the input .BIN file')
     parser.add_argument('tlog_path', type=str, help='Path to the input .tlog file')
@@ -508,6 +524,12 @@ def main() -> None:
         action='store_true',
         help="Don't check if the time series over of the mcap log and the tlog overlap",
     )
+    parser.add_argument(
+        '--tz-offset',
+        type=float,
+        default=DEFAULT_TZ_OFFSET_HOURS,
+        help=f'Timezone offset in hours to apply (default: {DEFAULT_TZ_OFFSET_HOURS} for {CURRENT_TZ_NAME})',
+    )
 
     argcomplete.autocomplete(parser)
     args = parser.parse_args()
@@ -517,6 +539,7 @@ def main() -> None:
         tlog_path=args.tlog_path,
         mcap_path=args.mcap,
         validate_times=not args.no_overlap_check,
+        offset_hours=args.tz_offset,
     )
 
 
