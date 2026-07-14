@@ -9,11 +9,11 @@
 # bytecode_bigmods_plugin.py must be in the same directory as this script.
 #
 # Usage:
-#   ./build.sh                # looks for sync_logs.py in this directory
+#   ./build.sh                # looks for sync.py in this directory
 #   ./build.sh my_script.py   # or pass the entry script explicitly
 set -euo pipefail
 
-ENTRY="${1:-sync_logs.py}"
+ENTRY="${1:-sync.py}"
 if [ ! -f "$ENTRY" ]; then
     echo "Entry script '$ENTRY' not found in $(pwd)." >&2
     echo "Usage: ./build.sh [path/to/script.py]" >&2
@@ -41,7 +41,7 @@ for cand in ('scipy._lib.array_api_compat', 'scipy._external.array_api_compat'):
 ARGS=(
   --standalone --onefile
   --output-dir=build
-  --output-filename=sync_logs
+  --output-filename=sync
   --user-plugin=bytecode_bigmods_plugin.py
   --no-deployment-flag=excluded-module-usage
 
@@ -111,4 +111,4 @@ fi
 
 python3 -m nuitka "${ARGS[@]}" "$ENTRY"
 
-echo "Binary produced at: build/sync_logs"
+echo "Binary produced at: build/sync"
