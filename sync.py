@@ -111,7 +111,7 @@ def read_tlog(tlog_file: str) -> npt.NDArray[numpy.float64]:
         time_us = msg.ts1 / 1e9
 
         # removing pixhawk restarts if there are
-        if last_time_us > time_us:
+        if round(last_time_us) > round(time_us):
             print(f'{Fore.YELLOW}Pixhawk restart at(removing) TimeUS: {last_time_us} - UnixTime: {unix_time}')
             samples = []
 
