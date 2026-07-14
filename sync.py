@@ -1,33 +1,18 @@
 #!/bin/python3
-"""
-Synchronizes an .mcap log's message timestamps onto GPS-derived unix time.
-
-Three inputs are correlated:
-  - a flight controller .BIN log, which provides:
-      * TSYN messages -> ground-station <-> autopilot round-trip time (RTT)
-      * GPS messages   -> autopilot time_us <-> GPS-synced unix time
-  - a ground-station .tlog, which provides:
-      * TIMESYNC messages -> autopilot time_us <-> ground-station unix time
-  - the .mcap file to be re-timestamped, whose messages carry ground-station
-    unix publish times.
-
-For each mcap message, its ground-station unix time is mapped to autopilot
-time, corrected for half the round-trip time, and then mapped to GPS-synced
-unix time - producing a new, GPS-accurate `publish_time` for that message.
-"""
 
 import argparse
 import sys
 import time
 from collections.abc import Iterator
 from multiprocessing.pool import ApplyResult, Pool
+from typing import Any
 
 import argcomplete
 import numpy
 import numpy.typing as npt
 from astropy.time import Time, TimeDelta
 from colorama import Fore, Style, init
-from mcap.reader import make_reader
+from mcap.reader import McapReader, make_reader
 from mcap.writer import CompressionType, Writer
 from pymavlink import mavutil
 from scipy.interpolate import interp1d
@@ -36,10 +21,9 @@ SECONDS_PER_WEEK = 7 * 24 * 60 * 60
 MIN_REQUIRED_SAMPLES = 2
 MAX_RTT_SECONDS = 5.0
 
-# Dynamically calculate the system's current timezone offset from UTC in hours.
 is_dst = time.localtime().tm_isdst > 0
-local_offset_seconds = -time.altzone if is_dst else -time.timezone
-DEFAULT_TZ_OFFSET_HOURS = local_offset_seconds / 3600.0
+LOCAL_OFFSET_SECONDS = -time.altzone if is_dst else -time.timezone
+DEFAULT_TZ_OFFSET_HOURS = 0
 CURRENT_TZ_NAME = time.tzname[1 if is_dst else 0]
 
 
@@ -47,13 +31,7 @@ class MissingDataError(Exception):
     pass
 
 
-# ============================================================================
-# Time conversion helpers
-# ============================================================================
-
-
 def gps_time_to_unix_time(gms: int, gwk: int, offset_hours: float = 0.0) -> float:
-    """Convert a GPS week number + milliseconds-of-week into unix time."""
     gps_week_start_seconds = gwk * SECONDS_PER_WEEK
 
     week_start = Time(gps_week_start_seconds, format='gps')
@@ -65,19 +43,12 @@ def gps_time_to_unix_time(gms: int, gwk: int, offset_hours: float = 0.0) -> floa
 
 
 def _require_min_samples(samples: list[tuple[float, float]], log_file: str, message_type: str) -> None:
-    """Raise MissingDataError if too few samples were collected to interpolate from."""
     if len(samples) < MIN_REQUIRED_SAMPLES:
         print(f"{Fore.RED}Didn't find any {message_type} in {log_file} - exiting", flush=True)
         raise MissingDataError(f'Missing {message_type} in {log_file}')
 
 
-# ============================================================================
-# Log readers (.BIN / .tlog)
-# ============================================================================
-
-
 def _iter_mavlink_messages(log_file: str, message_type: str) -> Iterator[mavutil.mavlink.MAVLink_message]:
-    """Yield each message of `message_type` from a mavlink log, in file order."""
     log = mavutil.mavlink_connection(log_file)
     while True:
         msg = log.recv_match()
@@ -88,7 +59,6 @@ def _iter_mavlink_messages(log_file: str, message_type: str) -> Iterator[mavutil
 
 
 def read_bin_log_timesync_rtt(bin_log_file: str) -> npt.NDArray[numpy.float64]:
-    """Read TSYN messages from a .BIN log as (autopilot_time_s, round_trip_time_s) pairs."""
     print(f'Started reading {bin_log_file} log TIMESYNC messages')
 
     samples = [(msg.TimeUS / 1e6, msg.RTT / 1e6) for msg in _iter_mavlink_messages(bin_log_file, 'TSYN')]
@@ -99,11 +69,6 @@ def read_bin_log_timesync_rtt(bin_log_file: str) -> npt.NDArray[numpy.float64]:
 
 
 def read_bin_log_gps(bin_log_file: str, offset_hours: float = 0.0) -> npt.NDArray[numpy.float64]:
-    """Read GPS messages from a .BIN log as (autopilot_time_s, gps_unix_time_s) pairs.
-
-    Rows with a poor fix (HDop > 2.5, fewer than 4 satellites) or without a valid
-    GPS week/time-of-week are skipped.
-    """
     print(f'Started reading {bin_log_file} log GPS messages')
 
     samples: list[tuple[float, float]] = []
@@ -124,12 +89,6 @@ def read_bin_log_gps(bin_log_file: str, offset_hours: float = 0.0) -> npt.NDArra
 
 
 def read_tlog(tlog_file: str) -> npt.NDArray[numpy.float64]:
-    """Read TIMESYNC messages from a .tlog as (autopilot_time_s, gcs_unix_time_s) pairs.
-
-    If a Pixhawk restart is detected (autopilot time going backwards), samples
-    collected before the restart are discarded, since they belong to a
-    different autopilot-time epoch.
-    """
     print(f'Started reading {tlog_file} TIMESYNC messages')
 
     samples: list[tuple[float, float]] = []
@@ -138,8 +97,7 @@ def read_tlog(tlog_file: str) -> npt.NDArray[numpy.float64]:
         if msg.tc1 == 0 or msg.ts1 == 0:
             continue
 
-        utc_time = msg.tc1 / 1e9
-        unix_time = Time(utc_time, format='unix', scale='utc').unix
+        unix_time = msg._timestamp  # pylint: disable=protected-access
         time_us = msg.ts1 / 1e9
 
         if last_time_us > time_us:
@@ -156,11 +114,6 @@ def read_tlog(tlog_file: str) -> npt.NDArray[numpy.float64]:
 
 
 def read_mcap_time_bounds(mcap_file: str) -> tuple[float, float]:
-    """Return the (start, end) unix timestamps spanned by an .mcap file's messages.
-
-    Uses the file's summary statistics when available; falls back to scanning
-    every message otherwise.
-    """
     print(f'Started reading {mcap_file} time bounds')
 
     with open(mcap_file, 'rb') as f:
@@ -193,31 +146,12 @@ def read_mcap_time_bounds(mcap_file: str) -> tuple[float, float]:
     return first_time_ns / 1e9, last_time_ns / 1e9
 
 
-# ============================================================================
-# Sequential nearest-index / interpolation lookups
-#
-# Every sync array below is sorted ascending in time, and every value we look
-# up (rtt samples in mcap-message order, mcap messages in file order, etc.)
-# arrives in non-decreasing order too. That means the matching bracket in the
-# sync array only ever moves forward, so a lookup never needs to restart its
-# search from the beginning - it just resumes from wherever the last lookup
-# left off. `SequentialLookup` captures that cursor so callers don't have to
-# thread the index through by hand.
-# ============================================================================
-
-
 def find_closest_index(
     value: float | int,
     start_index: int,
     sync_array: npt.NDArray[numpy.float64],
     compare_index: int = 0,
 ) -> int:
-    """
-    Starting at `start_index`, advance forward through `sync_array` (sorted
-    ascending on column `compare_index`) while the *next* row is still <=
-    `value`. Returns the index `i` of the bracket [i, i+1] that `value` falls
-    into (or the last available bracket, if `value` is past the array's end).
-    """
     max_idx = len(sync_array) - 2
 
     while start_index < max_idx and value > sync_array[start_index + 1][compare_index]:
@@ -227,14 +161,6 @@ def find_closest_index(
 
 
 class SequentialLookup:
-    """
-    A sorted two-column array plus a forward-only search cursor, supporting
-    repeated nearest-index and linear-interpolation lookups.
-
-    `compare_index` selects which column is the "key" being searched on; the
-    other column is the value that gets interpolated.
-    """
-
     def __init__(self, sync_array: npt.NDArray[numpy.float64], compare_index: int = 0) -> None:
         self.array = sync_array
         self._compare_index = compare_index
@@ -242,12 +168,10 @@ class SequentialLookup:
         self._cursor = 0
 
     def index_at(self, value: float) -> int:
-        """Advance the cursor to the bracket containing `value` and return its index."""
         self._cursor = find_closest_index(value, self._cursor, self.array, self._compare_index)
         return self._cursor
 
     def interpolate(self, value: float) -> float:
-        """Linearly interpolate (or extrapolate, past the array's ends) the value column at `value`."""
         idx = self.index_at(value)
         x = (self.array[idx][self._compare_index], self.array[idx + 1][self._compare_index])
         y = (self.array[idx][self._value_index], self.array[idx + 1][self._value_index])
@@ -260,7 +184,6 @@ def map_rtt_timeus_to_unixtime(
     rtt_times: npt.NDArray[numpy.float64],
     time_sync_times: npt.NDArray[numpy.float64],
 ) -> npt.NDArray[numpy.float64]:
-    """Rewrite `rtt_times`' time column from autopilot time_us into ground-station unix time, in place."""
     lookup = SequentialLookup(time_sync_times, compare_index=0)
 
     for row_index, (time_us, _rtt) in enumerate(rtt_times):
@@ -269,29 +192,17 @@ def map_rtt_timeus_to_unixtime(
     return rtt_times
 
 
-# ============================================================================
-# Per-message timestamp synchronization
-# ============================================================================
-
-
 def sync_mcap_timestamp(
     unixtime_pt_ns: int,
     rtt_lookup: SequentialLookup,
     unix_to_autopilot_lookup: SequentialLookup,
     autopilot_to_gps_lookup: SequentialLookup,
 ) -> int:
-    """
-    Convert one mcap message's ground-station unix publish_time (ns) into a
-    GPS-derived unix publish_time (ns):
-
-        gcs unix time -> autopilot time_us -> (- RTT / 2) -> GPS unix time
-    """
     unixtime_pt_s = float(unixtime_pt_ns) / 1e9
 
     rtt_index = rtt_lookup.index_at(unixtime_pt_s)
     rtt_s = rtt_lookup.array[rtt_index][1]
 
-    # if rtt crosses max_rtt_seconds take the rtt mean value
     if rtt_s >= MAX_RTT_SECONDS:
         rtt_col = rtt_lookup.array[:, 1]
         rtt_s = rtt_col[rtt_col < MAX_RTT_SECONDS].mean()
@@ -310,13 +221,7 @@ def sync_mcap_timestamp(
     return new_time_ns
 
 
-def _clone_schemas_and_channels(reader, writer) -> tuple[dict[int, int], dict[int, int]]:
-    """
-    Copy every schema and channel definition from `reader` into `writer`.
-
-    Returns (schema_id_map, channel_id_map), mapping each original id to the
-    id it was assigned in the new file.
-    """
+def _clone_schemas_and_channels(reader: McapReader, writer: Writer) -> tuple[dict[int, int], dict[int, int]]:
     summary = reader.get_summary()
 
     schema_id_map = {}
@@ -347,7 +252,6 @@ def sync_mcap(
     gps_sync_times: npt.NDArray[numpy.float64],
 ) -> None:
     # pylint: disable=too-many-locals
-    """Rewrite `mcap_log_file` to `<name>_synced.mcap` with GPS-synced publish times."""
     output_file = mcap_log_file.removesuffix('.mcap') + '_synced.mcap'
 
     rtt_lookup = SequentialLookup(rtt_times, compare_index=0)
@@ -389,17 +293,11 @@ def sync_mcap(
         print(f'{Fore.GREEN}{Style.BRIGHT}File writing finished successfully: {output_file}')
 
 
-# ============================================================================
-# Overlap validation
-# ============================================================================
-
-
 def check_if_time_spans_overlap(
     timesync_times: npt.NDArray[numpy.float64],
     mcap_start_s: float,
     mcap_end_s: float,
 ) -> bool:
-    """Return whether the tlog's time span and the mcap's time span overlap at all."""
     if len(timesync_times) < 2:
         return False
 
@@ -414,7 +312,6 @@ def validate_times_overlap(
     mcap_start_s: float,
     mcap_end_s: float,
 ) -> None:
-    """Print a warning if the tlog and mcap time spans don't share a common time section."""
     if check_if_time_spans_overlap(timesync_times, mcap_start_s, mcap_end_s):
         print(f'{Fore.GREEN}{Style.BRIGHT}Found overlapping time section in tlog and mcap time series')
         return
@@ -427,11 +324,6 @@ def validate_times_overlap(
     )
 
 
-# ============================================================================
-# Parallel orchestration
-# ============================================================================
-
-
 def _fail_and_terminate(pool: Pool, message: str, exit_code: int) -> None:
     """Print `message`, forcibly stop all pool workers, and exit the process."""
     print(message, flush=True)
@@ -440,13 +332,7 @@ def _fail_and_terminate(pool: Pool, message: str, exit_code: int) -> None:
     sys.exit(exit_code)
 
 
-def _wait_for_handles(pool: Pool, handles: list[ApplyResult]) -> None:
-    """
-    Poll `handles` until every one has completed.
-
-    Fails fast (terminating the pool) if any handle completes with a `None`
-    result, which signals missing tracking packets.
-    """
+def _wait_for_handles(pool: Pool, handles: list[ApplyResult[Any]]) -> None:
     while not all(h.ready() for h in handles):
         for h in handles:
             if h.ready() and h.get() is None:
@@ -459,8 +345,13 @@ def _wait_for_handles(pool: Pool, handles: list[ApplyResult]) -> None:
         time.sleep(0.1)
 
 
-def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str, validate_times: bool = True, offset_hours: float = 0.0) -> None:
-    """Read the .BIN/.tlog inputs concurrently, then produce the synced .mcap output."""
+def sync_parallel(
+    bin_path: str,
+    tlog_path: str,
+    mcap_path: str,
+    validate_times: bool = True,
+    offset_hours: float = 0.0,
+) -> None:
     with Pool(processes=3) as pool:
         try:
             rtt_handle = pool.apply_async(read_bin_log_timesync_rtt, args=(bin_path,))
@@ -494,21 +385,18 @@ def sync_parallel(bin_path: str, tlog_path: str, mcap_path: str, validate_times:
     sync_mcap(mcap_path, rtt_times, timesync_times, gps_timesync_times)
 
 
-# ============================================================================
-# CLI entry point
-# ============================================================================
-
-
 def main() -> None:
-    # Print the timezone context before parsing arguments so the user always sees it
-    print(f"{Fore.CYAN}System Current Timezone: {CURRENT_TZ_NAME} | Default Offset: {DEFAULT_TZ_OFFSET_HOURS} hours{Style.RESET_ALL}\n")
+    print(
+        f'{Fore.CYAN}System Current Timezone: {CURRENT_TZ_NAME} | '
+        + f'Default Offset: {DEFAULT_TZ_OFFSET_HOURS} hours{Style.RESET_ALL}\n',
+    )
 
     parser = argparse.ArgumentParser(
         description=(
             'Multiprocess log file synchronizer.\n'
             f'System Current Timezone: {CURRENT_TZ_NAME} | Default Offset: {DEFAULT_TZ_OFFSET_HOURS} hours'
         ),
-        formatter_class=argparse.RawTextHelpFormatter
+        formatter_class=argparse.RawTextHelpFormatter,
     )
 
     parser.add_argument('bin_path', type=str, help='Path to the input .BIN file')
