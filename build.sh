@@ -94,9 +94,6 @@ ARGS=(
   --nofollow-import-to=astropy.cosmology
   --nofollow-import-to=astropy.modeling
   --nofollow-import-to=astropy.nddata
-  --nofollow-import-to=astropy.io.votable
-  --nofollow-import-to=astropy.io.misc.pandas
-  --nofollow-import-to=astropy.io.misc.asdf
 
   --assume-yes-for-downloads
   --jobs="$(nproc)"
