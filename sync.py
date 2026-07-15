@@ -224,6 +224,7 @@ def sync_mcap_timestamp(
 
 def _clone_schemas_and_channels(reader: McapReader, writer: Writer) -> tuple[dict[int, int], dict[int, int]]:
     summary = reader.get_summary()
+    print(f'starting to sync {summary.statistics.message_count} messages')
 
     schema_id_map = {}
     for schema_id, schema_record in summary.schemas.items():
