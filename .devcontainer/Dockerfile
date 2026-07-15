@@ -5,7 +5,7 @@ RUN sudo apt update && sudo apt upgrade -y
 RUN sudo apt install -y python3 python3-pip git gpg tmux
 
 # for nuitka
-RUN sudo apt install -y patchelf
+RUN sudo apt install -y patchelf ccache
 
 COPY pyproject.toml .
 RUN uv pip install --system --break-system-packages -r pyproject.toml
