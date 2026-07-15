@@ -14,6 +14,7 @@ BYTECODE_MODULES = {
     'pymavlink.dialects.v20.ardupilotmega',
     'pymavlink.dialects.v20.common',
     'pymavlink.dialects.v09.ardupilotmega',
+    'pymavlink.dialects.v09.common',
 }
 
 # astropy.units'/coordinates' PLY-based lexer/parser machinery relies on

@@ -46,6 +46,9 @@ ARGS=(
   --no-deployment-flag=excluded-module-usage
 
   --include-module=pymavlink.dialects.v10.ardupilotmega
+  --include-module=pymavlink.dialects.v10.common
+  --include-module=pymavlink.dialects.v20.ardupilotmega
+  --include-module=pymavlink.dialects.v20.common
   --include-module=pymavlink.DFReader
   --include-module=astropy.constants.codata2022
   --include-module=astropy.constants.iau2015
@@ -94,7 +97,6 @@ ARGS=(
   --nofollow-import-to=astropy.io.votable
   --nofollow-import-to=astropy.io.misc.pandas
   --nofollow-import-to=astropy.io.misc.asdf
-  --nofollow-import-to=astropy.io.fits
 
   --assume-yes-for-downloads
   --jobs="$(nproc)"
