@@ -4,6 +4,7 @@ import argparse
 import sys
 import time
 from collections.abc import Iterator
+from datetime import datetime
 from multiprocessing.pool import ApplyResult, Pool
 from typing import Any
 
@@ -102,7 +103,8 @@ def read_tlog(tlog_file: str) -> npt.NDArray[numpy.float64]:
 
         # removing pixhawk restarts if there are
         if round(last_time_us) > round(time_us):
-            print(f'{Fore.YELLOW}Pixhawk restart at(removing) TimeUS: {last_time_us} - UnixTime: {unix_time}')
+            fmt_unix_time = datetime.fromtimestamp(unix_time).strftime('%Y-%m-%d %H:%M:%S')
+            print(f'{Fore.YELLOW}Pixhawk restart at(removing) TimeUS: {last_time_us} - UnixTime: {fmt_unix_time}')
             samples = []
 
         samples.append((time_us, unix_time))
@@ -247,6 +249,15 @@ def _clone_schemas_and_channels(reader: McapReader, writer: Writer) -> tuple[dic
     return schema_id_map, channel_id_map
 
 
+def print_progress(msg_count: int, num_of_msgs: int) -> None:
+    progress = round((msg_count / num_of_msgs) * 100, ndigits=1)
+    prev_msg_count_progress = round(((msg_count - 1) / num_of_msgs) * 100, ndigits=1)
+    precent_changed_last_cycle = prev_msg_count_progress != progress
+
+    if precent_changed_last_cycle and progress % 0.5 == 0:
+        print(f'Progress: synced {progress}%')
+
+
 def sync_mcap(
     mcap_log_file: str,
     rtt_times: npt.NDArray[numpy.float64],
@@ -273,8 +284,14 @@ def sync_mcap(
         print('Pass 1: Cloning file metadata structures...')
         _, channel_id_map = _clone_schemas_and_channels(reader, writer)
 
-        print('Pass 2: Rewriting messages with updated timestamps...')
+        num_of_messages = reader.get_summary().statistics.message_count
+        msg_count = 0
+
+        print('Pass 2: Rewriting messages with updated timestamps...', end='\n\n')
         for _, channel, message in reader.iter_messages():
+            msg_count += 1
+            print_progress(msg_count, num_of_messages)
+
             new_publish_time = sync_mcap_timestamp(
                 message.publish_time,
                 rtt_lookup,
@@ -319,9 +336,14 @@ def validate_times_overlap(
         return
 
     tlog_start_s, tlog_end_s = timesync_times[0][1], timesync_times[-1][1]
+    time_format = '%Y-%m-%d %H:%M:%S'
+    fmt_tlog_start = datetime.fromtimestamp(tlog_start_s).strftime(time_format)
+    fmt_tlog_end = datetime.fromtimestamp(tlog_end_s).strftime(time_format)
+    fmt_mcap_start = datetime.fromtimestamp(mcap_start_s).strftime(time_format)
+    fmt_mcap_end = datetime.fromtimestamp(mcap_end_s).strftime(time_format)
     print(
         f"{Fore.RED}{Style.BRIGHT}[WARNING] Time Sync probably didn't work as expected - "
-        f'.tlog ({tlog_start_s:.1f} - {tlog_end_s:.1f}) and mcap ({mcap_start_s:.1f} - {mcap_end_s:.1f}) '
+        f'.tlog ({fmt_tlog_start} - {fmt_tlog_end}) and mcap ({fmt_mcap_start} - {fmt_mcap_end}) '
         "don't share a common time section",
     )
 
